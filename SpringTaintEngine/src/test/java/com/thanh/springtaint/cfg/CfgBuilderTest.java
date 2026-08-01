@@ -60,4 +60,56 @@ class CfgBuilderTest {
                 .anyMatch(e -> e.from().equals(body) && e.to().equals(condition));
         assertTrue(hasBackEdge);
     }
+
+    @Test
+    void build_tryCatchFinally_wiresThrowsEdgesAndRunsFinallyOnBothPaths() {
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run() { try { doWork(); } catch (Exception e) { handle(); } finally { cleanup(); } }");
+
+        ControlFlowGraph cfg = new CfgBuilder().build(method);
+
+        // entry, exit, doWork, catch-entry, handle, finally-entry, cleanup
+        assertEquals(7, cfg.nodes().size());
+        assertEquals(7, cfg.edges().size());
+
+        CfgNode doWork = nodeContaining(cfg, "doWork");
+        CfgNode catchEntry = nodeContaining(cfg, "catch (");
+        CfgNode handle = nodeContaining(cfg, "handle");
+        CfgNode finallyEntry = nodeContaining(cfg, "finally");
+        CfgNode cleanup = nodeContaining(cfg, "cleanup");
+
+        assertTrue(hasEdge(cfg, doWork, catchEntry, "throws"));
+        assertTrue(hasEdge(cfg, catchEntry, handle, null));
+        // both the try's normal completion and the catch's normal completion reach finally
+        assertTrue(hasEdge(cfg, doWork, finallyEntry, null));
+        assertTrue(hasEdge(cfg, handle, finallyEntry, null));
+        assertTrue(hasEdge(cfg, finallyEntry, cleanup, null));
+        assertTrue(hasEdge(cfg, cleanup, cfg.exit(), null));
+    }
+
+    @Test
+    void build_tryCatchWithoutFinally_bothPathsGoStraightToExit() {
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run() { try { doWork(); } catch (Exception e) { handle(); } }");
+
+        ControlFlowGraph cfg = new CfgBuilder().build(method);
+
+        CfgNode doWork = nodeContaining(cfg, "doWork");
+        CfgNode handle = nodeContaining(cfg, "handle");
+
+        assertTrue(hasEdge(cfg, doWork, cfg.exit(), null));
+        assertTrue(hasEdge(cfg, handle, cfg.exit(), null));
+    }
+
+    private static CfgNode nodeContaining(ControlFlowGraph cfg, String labelSubstring) {
+        return cfg.nodes().stream()
+                .filter(n -> n.label() != null && n.label().contains(labelSubstring))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("No node with label containing: " + labelSubstring));
+    }
+
+    private static boolean hasEdge(ControlFlowGraph cfg, CfgNode from, CfgNode to, String label) {
+        return cfg.edges().stream()
+                .anyMatch(e -> e.from().equals(from) && e.to().equals(to) && java.util.Objects.equals(e.label(), label));
+    }
 }

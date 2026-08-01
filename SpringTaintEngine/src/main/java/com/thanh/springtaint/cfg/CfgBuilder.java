@@ -4,9 +4,11 @@ import com.github.javaparser.ast.NodeList;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.stmt.BlockStmt;
+import com.github.javaparser.ast.stmt.CatchClause;
 import com.github.javaparser.ast.stmt.ForStmt;
 import com.github.javaparser.ast.stmt.IfStmt;
 import com.github.javaparser.ast.stmt.Statement;
+import com.github.javaparser.ast.stmt.TryStmt;
 import com.github.javaparser.ast.stmt.WhileStmt;
 
 import java.util.ArrayList;
@@ -17,8 +19,20 @@ import java.util.stream.Collectors;
 
 /**
  * Builds an intraprocedural CFG for a single method body.
- * Supported constructs: sequential statements, if/else, while, for, return/throw.
- * Not supported yet: switch, try/catch, do-while, break/continue.
+ * Supported constructs: sequential statements, if/else, while, for,
+ * try/catch/finally (including try-with-resources), return/throw.
+ * Not supported yet: switch, do-while, break/continue.
+ *
+ * try/catch simplifications:
+ * - Exception edges are conservative and untyped: every statement inside a try block
+ *   gets an edge (labeled "throws") to every one of its catch clauses, regardless of
+ *   whether that catch's exception type could actually be thrown there or would
+ *   actually catch it -- consistent with the rest of this engine not doing symbol/type
+ *   resolution.
+ * - A return/throw inside a try or catch jumps straight to EXIT, bypassing any
+ *   enclosing finally block. Real Java semantics run the finally block first (and it
+ *   can even override the return value); modeling that exactly would mean duplicating
+ *   the finally block's CFG at every such exit point, deferred for now.
  */
 public class CfgBuilder {
 
@@ -69,6 +83,9 @@ public class CfgBuilder {
         }
         if (statement.isReturnStmt() || statement.isThrowStmt()) {
             return buildTerminal(statement, preds, incomingLabel);
+        }
+        if (statement.isTryStmt()) {
+            return buildTry(statement.asTryStmt(), preds, incomingLabel);
         }
         return buildLeaf(statement, preds, incomingLabel);
     }
@@ -136,6 +153,40 @@ public class CfgBuilder {
         }
 
         return forStmt.getCompare().isPresent() ? Set.of(condition) : Set.of();
+    }
+
+    private Set<CfgNode> buildTry(TryStmt tryStmt, Set<CfgNode> preds, String incomingLabel) {
+        Set<CfgNode> current = preds;
+        String label = incomingLabel;
+
+        if (!tryStmt.getResources().isEmpty()) {
+            CfgNode resources = newNode(CfgNode.Kind.STATEMENT,
+                    "try-resources: " + describeExpressions(tryStmt.getResources()));
+            linkAll(current, resources, label);
+            current = Set.of(resources);
+            label = null;
+        }
+
+        int beforeTryIndex = nodes.size();
+        Set<CfgNode> tryTails = buildStatements(tryStmt.getTryBlock().getStatements(), current, label);
+        List<CfgNode> tryBodyNodes = new ArrayList<>(nodes.subList(beforeTryIndex, nodes.size()));
+
+        Set<CfgNode> normalTails = new LinkedHashSet<>(tryTails);
+        for (CatchClause catchClause : tryStmt.getCatchClauses()) {
+            CfgNode catchEntry = newNode(CfgNode.Kind.STATEMENT, "catch (" + catchClause.getParameter() + ")");
+            for (CfgNode tryNode : tryBodyNodes) {
+                addEdge(tryNode, catchEntry, "throws");
+            }
+            normalTails.addAll(buildStatements(catchClause.getBody().getStatements(), Set.of(catchEntry), null));
+        }
+
+        if (tryStmt.getFinallyBlock().isPresent()) {
+            CfgNode finallyEntry = newNode(CfgNode.Kind.STATEMENT, "finally");
+            linkAll(normalTails, finallyEntry, null);
+            return buildStatements(tryStmt.getFinallyBlock().get().getStatements(), Set.of(finallyEntry), null);
+        }
+
+        return normalTails;
     }
 
     private String describeExpressions(NodeList<Expression> expressions) {

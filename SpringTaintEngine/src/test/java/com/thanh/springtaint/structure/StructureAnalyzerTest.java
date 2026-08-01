@@ -1,5 +1,7 @@
 package com.thanh.springtaint.structure;
 
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
 import com.thanh.springtaint.parser.JavaParserService;
 import com.thanh.springtaint.parser.ParserResult;
 import org.junit.jupiter.api.Test;
@@ -43,5 +45,34 @@ class StructureAnalyzerTest {
         assertEquals("statement", statement.name());
         assertEquals("Statement", statement.type());
         assertTrue(statement.annotations().isEmpty());
+    }
+
+    @Test
+    void analyze_recordDeclaration_isVisitedLikeAClass() {
+        // Records are the idiomatic modern Spring Boot shape for request/response DTOs
+        // (e.g. `record UserRequest(...)` used as an @RequestBody) -- before this fix the
+        // visitor only handled ClassOrInterfaceDeclaration, so records were silently skipped.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "record UserRequest(String name) { "
+                        + "String process(@RequestParam String extra) { return name + extra; } }");
+
+        List<ClassInfo> classes = new StructureAnalyzer().analyze(unit);
+
+        assertEquals(1, classes.size());
+        assertEquals("UserRequest", classes.get(0).name());
+        assertEquals(1, classes.get(0).methods().size());
+        assertEquals("process", classes.get(0).methods().get(0).name());
+    }
+
+    @Test
+    void analyze_enumDeclaration_isVisitedLikeAClass() {
+        CompilationUnit unit = StaticJavaParser.parse(
+                "enum Status { ACTIVE, INACTIVE; String describe() { return name(); } }");
+
+        List<ClassInfo> classes = new StructureAnalyzer().analyze(unit);
+
+        assertEquals(1, classes.size());
+        assertEquals("Status", classes.get(0).name());
+        assertEquals(1, classes.get(0).methods().size());
     }
 }
