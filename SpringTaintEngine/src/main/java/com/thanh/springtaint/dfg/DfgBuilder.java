@@ -5,15 +5,21 @@ import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.AssignExpr;
+import com.github.javaparser.ast.expr.ConditionalExpr;
 import com.github.javaparser.ast.expr.Expression;
+import com.github.javaparser.ast.expr.LambdaExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.expr.SwitchExpr;
 import com.github.javaparser.ast.stmt.BlockStmt;
 import com.github.javaparser.ast.stmt.CatchClause;
 import com.github.javaparser.ast.stmt.ForStmt;
 import com.github.javaparser.ast.stmt.IfStmt;
 import com.github.javaparser.ast.stmt.Statement;
+import com.github.javaparser.ast.stmt.SwitchEntry;
+import com.github.javaparser.ast.stmt.SwitchStmt;
 import com.github.javaparser.ast.stmt.TryStmt;
 import com.github.javaparser.ast.stmt.WhileStmt;
+import com.github.javaparser.ast.stmt.YieldStmt;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -92,8 +98,20 @@ public class DfgBuilder {
             evaluate(statement.asThrowStmt().getExpression());
         } else if (statement.isTryStmt()) {
             processTry(statement.asTryStmt());
+        } else if (statement.isSwitchStmt()) {
+            processSwitch(statement.asSwitchStmt());
         }
-        // other statement kinds (switch, do-while, etc.) are not walked yet.
+        // other statement kinds (do-while, etc.) are not walked yet.
+    }
+
+    private void processSwitch(SwitchStmt switchStmt) {
+        evaluate(switchStmt.getSelector());
+        // Every case body is walked in source order sharing the same reaching-definition map
+        // as the rest of this builder (no per-branch merge at the join point) -- same
+        // flow-insensitive simplification already applied to if/while/try above.
+        for (SwitchEntry entry : switchStmt.getEntries()) {
+            processStatements(entry.getStatements());
+        }
     }
 
     private void processTry(TryStmt tryStmt) {
@@ -197,6 +215,79 @@ public class DfgBuilder {
         if (expr.isAssignExpr()) {
             processAssign(expr.asAssignExpr());
             return currentDefs.get(assignTargetName(expr.asAssignExpr()));
+        }
+        if (expr.isConditionalExpr()) {
+            return evaluateConditional(expr.asConditionalExpr());
+        }
+        if (expr.isSwitchExpr()) {
+            return evaluateSwitchExpr(expr.asSwitchExpr());
+        }
+        if (expr.isLambdaExpr()) {
+            return evaluateLambda(expr.asLambdaExpr());
+        }
+        return null;
+    }
+
+    private DfgNode evaluateConditional(ConditionalExpr conditional) {
+        evaluate(conditional.getCondition());
+        DfgNode thenValue = evaluate(conditional.getThenExpr());
+        DfgNode elseValue = evaluate(conditional.getElseExpr());
+        if (thenValue == null && elseValue == null) {
+            return null;
+        }
+        DfgNode merge = newNode(DfgNode.Kind.EXPRESSION, null, conditional.toString());
+        linkIfPresent(thenValue, merge, "then");
+        linkIfPresent(elseValue, merge, "else");
+        return merge;
+    }
+
+    /**
+     * A switch expression's value is whichever branch is taken; every branch is merged into
+     * one node (same flow-insensitive join used for ternary/binary expressions above), whether
+     * the branch yields via an arrow ({@code case X -> value}) or an old-style {@code yield}.
+     */
+    private DfgNode evaluateSwitchExpr(SwitchExpr switchExpr) {
+        evaluate(switchExpr.getSelector());
+        DfgNode merge = newNode(DfgNode.Kind.EXPRESSION, null, switchExpr.toString());
+        boolean anyBranchLinked = false;
+        for (SwitchEntry entry : switchExpr.getEntries()) {
+            for (Statement stmt : entry.getStatements()) {
+                if (stmt.isExpressionStmt()) {
+                    linkIfPresent(evaluate(stmt.asExpressionStmt().getExpression()), merge, "case");
+                    anyBranchLinked = true;
+                }
+                for (YieldStmt yield : stmt.findAll(YieldStmt.class)) {
+                    linkIfPresent(evaluate(yield.getExpression()), merge, "case");
+                    anyBranchLinked = true;
+                }
+            }
+        }
+        return anyBranchLinked ? merge : null;
+    }
+
+    /**
+     * Expression-bodied lambdas ({@code x -> expr}) are evaluated like any other expression,
+     * sharing the enclosing method's reaching-definition map -- this makes closures over
+     * already-tainted locals visible (e.g. {@code list.forEach(x -> sink(taintedField, x))}).
+     * Block-bodied lambdas only have their top-level expression statements walked: a
+     * {@code return} inside a lambda block yields the LAMBDA's own value, not the enclosing
+     * method's, and this builder has no separate node kind for that -- reusing Kind.RETURN
+     * would wrongly make the taint engine treat it as the enclosing method returning, jumping
+     * taint back into every one of the enclosing method's callers. Left unmodeled rather than
+     * modeled incorrectly; the lambda's own parameter is never registered as a definition
+     * either, since nothing here knows what value it's actually invoked with.
+     */
+    private DfgNode evaluateLambda(LambdaExpr lambda) {
+        Statement body = lambda.getBody();
+        if (body.isExpressionStmt()) {
+            return evaluate(body.asExpressionStmt().getExpression());
+        }
+        if (body.isBlockStmt()) {
+            for (Statement stmt : body.asBlockStmt().getStatements()) {
+                if (stmt.isExpressionStmt()) {
+                    evaluate(stmt.asExpressionStmt().getExpression());
+                }
+            }
         }
         return null;
     }

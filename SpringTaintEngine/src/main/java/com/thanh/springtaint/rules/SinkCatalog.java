@@ -25,7 +25,25 @@ public class SinkCatalog {
                 new SinkRule("Connection", "prepareStatement", Set.of(0),
                         VulnerabilityType.SQL_INJECTION, "JDBC Connection.prepareStatement(sql)"),
                 new SinkRule(null, "exec", Set.of(0),
-                        VulnerabilityType.COMMAND_INJECTION, "Runtime.exec(command)")
+                        VulnerabilityType.COMMAND_INJECTION, "Runtime.exec(command)"),
+                new SinkRule("RestTemplate", "getForObject", Set.of(0),
+                        VulnerabilityType.SSRF, "RestTemplate.getForObject(url)"),
+                new SinkRule("RestTemplate", "getForEntity", Set.of(0),
+                        VulnerabilityType.SSRF, "RestTemplate.getForEntity(url)"),
+                new SinkRule("RestTemplate", "postForObject", Set.of(0),
+                        VulnerabilityType.SSRF, "RestTemplate.postForObject(url)"),
+                new SinkRule("RestTemplate", "exchange", Set.of(0),
+                        VulnerabilityType.SSRF, "RestTemplate.exchange(url)"),
+                new SinkRule("Files", "newInputStream", Set.of(0),
+                        VulnerabilityType.PATH_TRAVERSAL, "Files.newInputStream(path)"),
+                new SinkRule("Files", "readAllBytes", Set.of(0),
+                        VulnerabilityType.PATH_TRAVERSAL, "Files.readAllBytes(path)"),
+                new SinkRule("PrintWriter", "print", Set.of(0),
+                        VulnerabilityType.CROSS_SITE_SCRIPTING, "PrintWriter.print(value) into an HTTP response"),
+                new SinkRule("PrintWriter", "println", Set.of(0),
+                        VulnerabilityType.CROSS_SITE_SCRIPTING, "PrintWriter.println(value) into an HTTP response"),
+                new SinkRule("ObjectInputStream", "readObject", Set.of(SinkRule.RECEIVER_INDEX),
+                        VulnerabilityType.INSECURE_DESERIALIZATION, "readObject() on an attacker-controlled stream")
         ));
     }
 

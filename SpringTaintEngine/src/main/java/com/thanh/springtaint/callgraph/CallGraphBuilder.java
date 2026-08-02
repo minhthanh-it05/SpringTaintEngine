@@ -10,6 +10,7 @@ import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
+import com.github.javaparser.resolution.declarations.ResolvedMethodDeclaration;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -27,9 +28,17 @@ import java.util.Set;
  * (classes, interfaces, enums, records), not just {@link ClassOrInterfaceDeclaration}
  * directly, so record/enum methods are indexed and callable too.
  *
- * There is no symbol solver wired up (same choice as
- * {@link com.thanh.springtaint.dfg.DfgBuilder}), so a call's target class is
- * resolved purely syntactically:
+ * Resolution is symbol-solver-first, syntactic-heuristic-fallback: when the
+ * {@code CompilationUnit} a call belongs to had a {@code JavaSymbolSolver} injected into it
+ * (done by {@link com.thanh.springtaint.parser.JavaParserService#parseDirectory}, which scopes
+ * one to the JDK plus the directory being scanned), {@code call.resolve()} is tried first and,
+ * on success, gives ground-truth class/overload resolution -- handles statics, generics and
+ * inherited methods the heuristic below cannot. It very often can't resolve (missing classpath
+ * jars, unresolved external/library types, or -- in every unit test in this codebase, and any
+ * ad-hoc {@code StaticJavaParser.parse(String)} snippet -- no resolver configured at all), in
+ * which case it throws and this silently falls through to the same purely syntactic resolution
+ * this engine has always used ({@link com.thanh.springtaint.dfg.DfgBuilder} makes the identical
+ * no-symbol-solver choice, unconditionally):
  * - no scope / {@code this.foo()} -> same class as the caller.
  * - {@code x.foo()} where {@code x} is a parameter, local variable, or field with a
  *   known declared type in the parsed sources -> that declared type's simple name.
@@ -186,6 +195,11 @@ public class CallGraphBuilder {
     }
 
     private MethodKey resolveCallee(MethodCallExpr call, String callerClassName, Map<String, String> localTypes) {
+        MethodKey symbolic = trySymbolicResolve(call);
+        if (symbolic != null) {
+            return symbolic;
+        }
+
         String methodName = call.getNameAsString();
         int argCount = call.getArguments().size();
 
@@ -193,6 +207,28 @@ public class CallGraphBuilder {
                 .map(scope -> resolveScopeClass(scope, callerClassName, localTypes))
                 .orElse(callerClassName);
         return new MethodKey(calleeClass, methodName, argCount);
+    }
+
+    /**
+     * Ground-truth resolution via a {@code JavaSymbolSolver}, when one was injected into this
+     * call's {@code CompilationUnit} (see class javadoc). {@code null} means "couldn't resolve
+     * this one" -- either no resolver is configured at all (every unit test snippet), or the
+     * symbol genuinely can't be found (missing classpath jar, unresolved generic, ...); both
+     * are expected, routine outcomes here, not errors, so the caller falls back to the
+     * syntactic heuristic rather than this method throwing.
+     *
+     * Uses the resolved method's own declared parameter count (not the call site's argument
+     * count) so varargs calls key the same way a method's own declaration is keyed elsewhere
+     * in this class (by {@code method.getParameters().size()}).
+     */
+    private MethodKey trySymbolicResolve(MethodCallExpr call) {
+        try {
+            ResolvedMethodDeclaration resolved = call.resolve();
+            String simpleClassName = simpleTypeName(resolved.declaringType().getQualifiedName());
+            return new MethodKey(simpleClassName, resolved.getName(), resolved.getNumberOfParams());
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     private String resolveScopeClass(Expression scope, String callerClassName, Map<String, String> localTypes) {

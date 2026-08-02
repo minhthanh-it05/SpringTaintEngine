@@ -2,8 +2,14 @@ package com.thanh.springtaint.callgraph;
 
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
+import com.thanh.springtaint.parser.JavaParserService;
+import com.thanh.springtaint.parser.ParserResult;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -129,6 +135,32 @@ class CallGraphBuilderTest {
 
         MethodKey caller = new MethodKey("UserRequest", "process", 0);
         MethodKey callee = new MethodKey("UserRequest", "helper", 0);
+        assertTrue(graph.edges().stream().anyMatch(e -> e.caller().equals(caller) && e.callee().equals(callee)));
+        assertFalse(graph.isExternal(callee));
+    }
+
+    @Test
+    void build_withSymbolResolverInjected_resolvesThroughAChainedCallTheSyntacticHeuristicCannot(
+            @TempDir Path tempDir) throws IOException {
+        // Same chained-call shape as build_chainedCallWithUnresolvableScope_marksCalleeClassUnknown
+        // above (getter.getService().find(id): the scope of .find(...) is itself a method call,
+        // not a typed variable), but this time scanned via JavaParserService#parseDirectory,
+        // which injects a JavaSymbolSolver scoped to tempDir. Proves the symbol-solver-first
+        // resolution in resolveCallee() actually resolves what the syntactic heuristic alone
+        // cannot -- the "?" class from the other test becomes the real "Service" here.
+        Files.writeString(tempDir.resolve("Getter.java"), "class Getter { Service getService() { return null; } }");
+        Files.writeString(tempDir.resolve("Service.java"), "class Service { String find(String id) { return id; } }");
+        Files.writeString(tempDir.resolve("Caller.java"),
+                "class Caller { Getter getter; String run(String id) { return getter.getService().find(id); } }");
+
+        List<CompilationUnit> units = new JavaParserService().parseDirectory(tempDir).stream()
+                .map(ParserResult::getCompilationUnit)
+                .toList();
+
+        CallGraph graph = new CallGraphBuilder().build(units);
+
+        MethodKey caller = new MethodKey("Caller", "run", 1);
+        MethodKey callee = new MethodKey("Service", "find", 1);
         assertTrue(graph.edges().stream().anyMatch(e -> e.caller().equals(caller) && e.callee().equals(callee)));
         assertFalse(graph.isExternal(callee));
     }

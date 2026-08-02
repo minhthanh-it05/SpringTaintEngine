@@ -3,6 +3,10 @@ package com.thanh.springtaint.parser;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.symbolsolver.JavaSymbolSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.ReflectionTypeSolver;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -49,6 +53,22 @@ public class JavaParserService {
                 results.add(parseFile(file));
             }
         }
+
+        // Best-effort symbol resolution, scoped to this one directory: JDK types via
+        // reflection (always available) plus every type declared under `directory` itself
+        // (covers the common case CallGraphBuilder's syntactic heuristic struggles with most --
+        // an interface field resolving to its sibling implementation file). Types from
+        // anything else (Spring, a library on some external classpath we were never given)
+        // simply fail to resolve and CallGraphBuilder falls back to its syntactic heuristic --
+        // this is deliberately best-effort, not a hard requirement for the engine to run.
+        CombinedTypeSolver typeSolver = new CombinedTypeSolver();
+        typeSolver.add(new ReflectionTypeSolver());
+        typeSolver.add(new JavaParserTypeSolver(directory));
+        JavaSymbolSolver symbolSolver = new JavaSymbolSolver(typeSolver);
+        for (ParserResult result : results) {
+            symbolSolver.inject(result.getCompilationUnit());
+        }
+
         return results;
     }
 }

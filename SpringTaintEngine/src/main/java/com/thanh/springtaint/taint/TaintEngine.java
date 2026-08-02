@@ -31,8 +31,8 @@ import java.util.Set;
  * Runs a worklist reachability analysis over a graph stitched together from every
  * parsed method's DFG (M5) via the Call Graph (M6): a tainted value that flows into an
  * argument of a call to an internally-declared method jumps into that callee's matching
- * PARAM node, and a tainted RETURN jumps back into every CALL node (across every caller)
- * that invokes that method. Whenever taint reaches an argument position of a call that
+ * PARAM node, and a tainted RETURN jumps back into the CALL node it was entered from (see
+ * "1-call-site-sensitive" below). Whenever taint reaches an argument position of a call that
  * matches a registered {@link SinkRule} (M7), a {@link TaintFinding} is recorded with
  * the full source-to-sink path.
  *
@@ -45,12 +45,21 @@ import java.util.Set;
  * to every concrete override it can find), in which case taint is propagated into
  * -- and sinks are checked against -- every one of them.
  *
+ * Sanitizer-aware: when every callee a call site resolves to is a registered
+ * {@link com.thanh.springtaint.rules.SanitizerRule} for the tainted argument position (M-B1),
+ * taint stops there instead of continuing into the call's result -- e.g. an SQL string built
+ * from {@code Integer.parseInt(id)} isn't reported as reaching a sink further down.
+ *
+ * 1-call-site-sensitive: a {@link NodeRef} carries the single call site it was entered
+ * through (see its javadoc), so when taint returns from a callee it jumps back into that
+ * *specific* caller, not into every caller of that method. This is a real precision
+ * improvement over broadcasting to every call site, but it is truncated to depth 1: once
+ * taint crosses a second method boundary the recorded context is discarded and propagation
+ * reverts to broadcasting from there on. A full call-stack-sensitive (k=∞) analysis would
+ * remove this residual imprecision at the cost of a potentially unbounded state space.
+ *
  * Known trade-offs (same "get it running end-to-end first" spirit as the
  * simplifications already documented on CfgBuilder/DfgBuilder/CallGraphBuilder):
- * - Context-insensitive: call sites aren't distinguished, so a method reachable from
- *   several callers is analyzed once for the union of taint reaching it, not once per
- *   caller. Can't produce a false "clean" result, but a reported path is not guaranteed
- *   to correspond to one single concrete call chain.
  * - One parent pointer per node: when two different sources both flow into the same
  *   downstream node (e.g. two tainted parameters concatenated together), only the
  *   first-discovered path is kept for reporting, even though both origins do reach the
@@ -137,7 +146,14 @@ public class TaintEngine {
             DfgNode currentNode = dfg.node(current.nodeId());
 
             if (currentNode.kind() == DfgNode.Kind.RETURN) {
-                for (NodeRef callSite : callSitesByCallee.getOrDefault(current.method(), List.of())) {
+                // With a specific entry call site recorded (context != null), return there and
+                // only there. Otherwise (context-free: a source-originating return, or context
+                // already spent one hop earlier) fall back to broadcasting to every known call
+                // site of this method, same as the fully context-insensitive behavior.
+                List<NodeRef> returnTargets = current.context() != null
+                        ? List.of(new NodeRef(current.context().callerMethod(), current.context().callerCallNodeId()))
+                        : callSitesByCallee.getOrDefault(current.method(), List.of());
+                for (NodeRef callSite : returnTargets) {
                     if (visited.add(callSite)) {
                         cameFrom.put(callSite, current);
                         worklist.add(callSite);
@@ -150,19 +166,38 @@ public class TaintEngine {
                     continue;
                 }
                 DfgNode to = edge.to();
-                NodeRef toRef = new NodeRef(current.method(), to.id());
+                // Still inside the same call frame -- carries the same context as current.
+                NodeRef toRef = new NodeRef(current.method(), to.id(), current.context());
+
+                boolean isArgEdge = to.kind() == DfgNode.Kind.CALL && edge.label() != null && edge.label().startsWith("arg");
+                boolean isReceiverEdge = to.kind() == DfgNode.Kind.CALL && "receiver".equals(edge.label());
+                if (!isArgEdge && !isReceiverEdge) {
+                    if (visited.add(toRef)) {
+                        cameFrom.put(toRef, current);
+                        worklist.add(toRef);
+                    }
+                    continue;
+                }
+
+                int argumentIndex = isReceiverEdge ? SinkRule.RECEIVER_INDEX : Integer.parseInt(edge.label().substring(3));
+                Set<MethodKey> callees = calleeBySite.getOrDefault(current.method(), Map.of())
+                        .getOrDefault(to.label(), Set.of());
+
+                boolean sanitizedByEveryCallee = !callees.isEmpty() && argumentIndex != SinkRule.RECEIVER_INDEX
+                        && callees.stream().allMatch(callee -> rules.sanitizers().sanitizes(callee, argumentIndex));
+                if (sanitizedByEveryCallee) {
+                    continue; // neutralized here: don't mark the call node (or its downstream) tainted
+                }
+
                 if (visited.add(toRef)) {
                     cameFrom.put(toRef, current);
                     worklist.add(toRef);
                 }
 
-                if (to.kind() == DfgNode.Kind.CALL && edge.label() != null && edge.label().startsWith("arg")) {
-                    int argumentIndex = Integer.parseInt(edge.label().substring(3));
-                    Set<MethodKey> callees = calleeBySite.getOrDefault(current.method(), Map.of())
-                            .getOrDefault(to.label(), Set.of());
-                    for (MethodKey callee : callees) {
-                        recordSinkHits(current, to, argumentIndex, callee, cameFrom, rootSource, findings);
-                        jumpIntoCallee(callee, argumentIndex, current, visited, cameFrom, worklist);
+                for (MethodKey callee : callees) {
+                    recordSinkHits(current, to, argumentIndex, callee, cameFrom, rootSource, findings);
+                    if (argumentIndex != SinkRule.RECEIVER_INDEX) {
+                        jumpIntoCallee(callee, argumentIndex, current, to, visited, cameFrom, worklist);
                     }
                 }
             }
@@ -192,8 +227,8 @@ public class TaintEngine {
         }
     }
 
-    private void jumpIntoCallee(MethodKey callee, int argumentIndex, NodeRef current, Set<NodeRef> visited,
-                                 Map<NodeRef, NodeRef> cameFrom, Deque<NodeRef> worklist) {
+    private void jumpIntoCallee(MethodKey callee, int argumentIndex, NodeRef current, DfgNode callNode,
+                                 Set<NodeRef> visited, Map<NodeRef, NodeRef> cameFrom, Deque<NodeRef> worklist) {
         if (callGraph.isExternal(callee)) {
             return;
         }
@@ -203,7 +238,10 @@ public class TaintEngine {
             return;
         }
         DfgNode calleeParamNode = calleeDfg.paramNode(argumentIndex);
-        NodeRef calleeRef = new NodeRef(callee, calleeParamNode.id());
+        // Depth-1 truncation: the callee's context is exactly this call site, regardless of
+        // whatever context `current` itself was carrying.
+        NodeRef.CallSite context = new NodeRef.CallSite(current.method(), callNode.id());
+        NodeRef calleeRef = new NodeRef(callee, calleeParamNode.id(), context);
         if (visited.add(calleeRef)) {
             cameFrom.put(calleeRef, current);
             worklist.add(calleeRef);

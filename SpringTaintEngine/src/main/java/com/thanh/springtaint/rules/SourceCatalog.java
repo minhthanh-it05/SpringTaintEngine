@@ -27,7 +27,10 @@ public class SourceCatalog {
         return new SourceCatalog(List.of(
                 new SourceRule("RequestParam", "Query string / form parameter"),
                 new SourceRule("PathVariable", "URI template variable"),
-                new SourceRule("RequestBody", "Deserialized HTTP request body")
+                new SourceRule("RequestBody", "Deserialized HTTP request body"),
+                new SourceRule("RequestHeader", "HTTP request header"),
+                new SourceRule("CookieValue", "HTTP cookie value"),
+                new SourceRule("MatrixVariable", "URI matrix variable")
         ));
     }
 
