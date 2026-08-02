@@ -1,6 +1,6 @@
 package com.thanh.springtaint.rules;
 
-import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.CallableDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.expr.AnnotationExpr;
 
@@ -38,10 +38,10 @@ public class SourceCatalog {
         return sourceAnnotations.contains(annotationSimpleName);
     }
 
-    /** Parameters of {@code method} annotated with a registered Source annotation, in declaration order. */
-    public List<TaintedParameter> findSources(MethodDeclaration method) {
+    /** Parameters of {@code callable} annotated with a registered Source annotation, in declaration order. */
+    public List<TaintedParameter> findSources(CallableDeclaration<?> callable) {
         List<TaintedParameter> sources = new ArrayList<>();
-        List<Parameter> parameters = method.getParameters();
+        List<Parameter> parameters = callable.getParameters();
         for (int i = 0; i < parameters.size(); i++) {
             Parameter parameter = parameters.get(i);
             for (AnnotationExpr annotation : parameter.getAnnotations()) {

@@ -15,6 +15,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class StructureAnalyzerTest {
 
+    static {
+        // Record syntax below needs JavaParser's language level bumped past its ancient
+        // default -- JavaParserService's static initializer does that globally, but this class
+        // must not depend on some other test class happening to load it first (real Surefire
+        // runs classes in an order that isn't source-file order, unlike this repo's hand-rolled
+        // JUnit Platform Launcher runner -- this exact fragility only surfaced under `mvn test`).
+        new JavaParserService();
+    }
+
     private static final Path SAMPLE_FILE = Path.of("src/main/resources/samples/SampleController.java");
 
     @Test

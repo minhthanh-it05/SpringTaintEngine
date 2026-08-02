@@ -6,6 +6,8 @@ target/
 
 ### SpringTaintEngine generated reports ###
 taint-report.json
+taint-report.sarif
+dependency-reduced-pom.xml
 
 ### IntelliJ IDEA ###
 .idea/modules.xml

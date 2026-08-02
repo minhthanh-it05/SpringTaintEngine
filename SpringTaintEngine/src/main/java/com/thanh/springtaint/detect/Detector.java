@@ -1,7 +1,7 @@
 package com.thanh.springtaint.detect;
 
 import com.github.javaparser.ast.CompilationUnit;
-import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.CallableDeclaration;
 import com.github.javaparser.ast.body.TypeDeclaration;
 import com.thanh.springtaint.callgraph.MethodKey;
 import com.thanh.springtaint.parser.JavaParserService;
@@ -85,7 +85,7 @@ public class Detector {
     }
 
     private Location locate(MethodKey key, TaintEngine engine, Map<String, Path> fileByClassName) {
-        MethodDeclaration declaration = engine.methodDeclaration(key);
+        CallableDeclaration<?> declaration = engine.methodDeclaration(key);
         int line = declaration != null && declaration.getBegin().isPresent() ? declaration.getBegin().get().line : -1;
         Path file = fileByClassName.get(key.className());
         return new Location(file == null ? null : file.toString(), line);

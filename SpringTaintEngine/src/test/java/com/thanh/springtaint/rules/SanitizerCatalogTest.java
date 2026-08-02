@@ -28,4 +28,30 @@ class SanitizerCatalogTest {
 
         assertFalse(catalog.sanitizes(new MethodKey("Statement", "executeQuery", 1), 0));
     }
+
+    @Test
+    void sanitizes_matchesApacheCommonsAndJsoupEscapingHelpers() {
+        SanitizerCatalog catalog = SanitizerCatalog.defaults();
+
+        assertTrue(catalog.sanitizes(new MethodKey("StringEscapeUtils", "escapeHtml4", 1), 0));
+        assertTrue(catalog.sanitizes(new MethodKey("StringEscapeUtils", "escapeSql", 1), 0));
+        assertTrue(catalog.sanitizes(new MethodKey("Jsoup", "clean", 2), 0));
+    }
+
+    @Test
+    void sanitizes_matchesFilenameUtilsGetNameAndUuidFromString() {
+        SanitizerCatalog catalog = SanitizerCatalog.defaults();
+
+        assertTrue(catalog.sanitizes(new MethodKey("FilenameUtils", "getName", 1), 0));
+        assertTrue(catalog.sanitizes(new MethodKey("UUID", "fromString", 1), 0));
+    }
+
+    @Test
+    void sanitizes_doesNotTreatPathsGetAsASanitizer() {
+        // Paths.get(...) parses a string into a Path but does NOT strip ".." traversal
+        // segments -- it must never be treated as neutralizing Path Traversal taint.
+        SanitizerCatalog catalog = SanitizerCatalog.defaults();
+
+        assertFalse(catalog.sanitizes(new MethodKey("Paths", "get", 1), 0));
+    }
 }

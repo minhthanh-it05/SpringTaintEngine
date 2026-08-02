@@ -1,6 +1,9 @@
 package com.thanh.springtaint.taint;
 
 import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.CallableDeclaration;
+import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.TypeDeclaration;
 import com.thanh.springtaint.callgraph.CallGraph;
@@ -28,21 +31,21 @@ import java.util.Set;
 /**
  * Whole-project, interprocedural taint propagation.
  *
- * Runs a worklist reachability analysis over a graph stitched together from every
- * parsed method's DFG (M5) via the Call Graph (M6): a tainted value that flows into an
- * argument of a call to an internally-declared method jumps into that callee's matching
- * PARAM node, and a tainted RETURN jumps back into the CALL node it was entered from (see
- * "1-call-site-sensitive" below). Whenever taint reaches an argument position of a call that
- * matches a registered {@link SinkRule} (M7), a {@link TaintFinding} is recorded with
- * the full source-to-sink path.
+ * Runs a worklist reachability analysis over a graph stitched together from every parsed
+ * method/constructor's DFG (M5) via the Call Graph (M6): a tainted value that flows into an
+ * argument of a call to an internally-declared method/constructor jumps into that callee's
+ * matching PARAM node, and a tainted RETURN jumps back into the CALL node it was entered from
+ * (see "bounded call-site sensitivity" below). Whenever taint reaches an argument position of
+ * a call that matches a registered {@link SinkRule} (M7), a {@link TaintFinding} is recorded
+ * with the full source-to-sink path.
  *
  * The correlation between a DFG {@code CALL} node and the {@link MethodKey}(s) it
- * resolves to is done by matching call-site text ({@code MethodCallExpr.toString()})
- * against the Call Graph's edges for that caller, rather than re-implementing
- * scope/type resolution here -- reuses CallGraphBuilder's resolution as the single
- * source of truth instead of risking the two builders disagreeing. A call site can
- * resolve to more than one callee (CallGraphBuilder fans an interface/abstract call out
- * to every concrete override it can find), in which case taint is propagated into
+ * resolves to is done by matching call-site text ({@code MethodCallExpr.toString()} or
+ * {@code ObjectCreationExpr.toString()}) against the Call Graph's edges for that caller,
+ * rather than re-implementing scope/type resolution here -- reuses CallGraphBuilder's
+ * resolution as the single source of truth instead of risking the two builders disagreeing.
+ * A call site can resolve to more than one callee (CallGraphBuilder fans an interface/abstract
+ * call out to every concrete override it can find), in which case taint is propagated into
  * -- and sinks are checked against -- every one of them.
  *
  * Sanitizer-aware: when every callee a call site resolves to is a registered
@@ -50,13 +53,15 @@ import java.util.Set;
  * taint stops there instead of continuing into the call's result -- e.g. an SQL string built
  * from {@code Integer.parseInt(id)} isn't reported as reaching a sink further down.
  *
- * 1-call-site-sensitive: a {@link NodeRef} carries the single call site it was entered
- * through (see its javadoc), so when taint returns from a callee it jumps back into that
- * *specific* caller, not into every caller of that method. This is a real precision
- * improvement over broadcasting to every call site, but it is truncated to depth 1: once
- * taint crosses a second method boundary the recorded context is discarded and propagation
- * reverts to broadcasting from there on. A full call-stack-sensitive (k=∞) analysis would
- * remove this residual imprecision at the cost of a potentially unbounded state space.
+ * Bounded call-site sensitive: a {@link NodeRef} carries the chain of call sites it was
+ * entered through (see its javadoc), up to {@link NodeRef#MAX_CONTEXT_DEPTH} frames deep, so
+ * when taint returns from a callee it jumps back into that *specific* caller -- and that
+ * caller's caller, and so on up to the depth cap -- rather than broadcasting to every caller
+ * of a method. Beyond the cap (or once a context is fully consumed by returning through it),
+ * propagation degrades to broadcasting from there on, same as a fully context-insensitive
+ * analysis would. The cap exists because an unbounded call-stack-sensitive (k=∞) analysis has
+ * a potentially unbounded state space under recursion; a small fixed depth is the standard
+ * k-CFA compromise.
  *
  * Known trade-offs (same "get it running end-to-end first" spirit as the
  * simplifications already documented on CfgBuilder/DfgBuilder/CallGraphBuilder):
@@ -71,7 +76,7 @@ public class TaintEngine {
 
     private final TaintRules rules;
     private final CallGraph callGraph;
-    private final Map<MethodKey, MethodDeclaration> methodsByKey = new HashMap<>();
+    private final Map<MethodKey, CallableDeclaration<?>> callablesByKey = new HashMap<>();
     private final Map<MethodKey, DataFlowGraph> dfgByKey = new HashMap<>();
     private final Map<MethodKey, Map<String, Set<MethodKey>>> calleeBySite = new HashMap<>();
     private final Map<MethodKey, List<NodeRef>> callSitesByCallee = new HashMap<>();
@@ -84,8 +89,16 @@ public class TaintEngine {
                 String className = typeDecl.getNameAsString();
                 for (MethodDeclaration method : typeDecl.getMethods()) {
                     MethodKey key = new MethodKey(className, method.getNameAsString(), method.getParameters().size());
-                    methodsByKey.put(key, method);
+                    callablesByKey.put(key, method);
                     dfgByKey.put(key, new DfgBuilder().build(method));
+                }
+                if (typeDecl instanceof ClassOrInterfaceDeclaration classOrInterface) {
+                    for (ConstructorDeclaration constructor : classOrInterface.getConstructors()) {
+                        MethodKey key = new MethodKey(className, MethodKey.CONSTRUCTOR_METHOD_NAME,
+                                constructor.getParameters().size());
+                        callablesByKey.put(key, constructor);
+                        dfgByKey.put(key, new DfgBuilder().build(constructor));
+                    }
                 }
             }
         }
@@ -115,9 +128,9 @@ public class TaintEngine {
         }
     }
 
-    /** The declaration backing {@code key}, or null when {@code key} isn't one of the parsed methods (e.g. an external sink). */
-    public MethodDeclaration methodDeclaration(MethodKey key) {
-        return methodsByKey.get(key);
+    /** The declaration backing {@code key} (method or constructor), or null when {@code key} isn't one of the parsed callables (e.g. an external sink). */
+    public CallableDeclaration<?> methodDeclaration(MethodKey key) {
+        return callablesByKey.get(key);
     }
 
     public List<TaintFinding> analyze() {
@@ -127,7 +140,7 @@ public class TaintEngine {
         Deque<NodeRef> worklist = new ArrayDeque<>();
         List<TaintFinding> findings = new ArrayList<>();
 
-        for (Map.Entry<MethodKey, MethodDeclaration> entry : methodsByKey.entrySet()) {
+        for (Map.Entry<MethodKey, CallableDeclaration<?>> entry : callablesByKey.entrySet()) {
             MethodKey method = entry.getKey();
             for (TaintedParameter source : rules.sources().findSources(entry.getValue())) {
                 DfgNode paramNode = dfgByKey.get(method).paramNode(source.index());
@@ -146,13 +159,7 @@ public class TaintEngine {
             DfgNode currentNode = dfg.node(current.nodeId());
 
             if (currentNode.kind() == DfgNode.Kind.RETURN) {
-                // With a specific entry call site recorded (context != null), return there and
-                // only there. Otherwise (context-free: a source-originating return, or context
-                // already spent one hop earlier) fall back to broadcasting to every known call
-                // site of this method, same as the fully context-insensitive behavior.
-                List<NodeRef> returnTargets = current.context() != null
-                        ? List.of(new NodeRef(current.context().callerMethod(), current.context().callerCallNodeId()))
-                        : callSitesByCallee.getOrDefault(current.method(), List.of());
+                List<NodeRef> returnTargets = returnTargets(current);
                 for (NodeRef callSite : returnTargets) {
                     if (visited.add(callSite)) {
                         cameFrom.put(callSite, current);
@@ -206,6 +213,23 @@ public class TaintEngine {
         return findings;
     }
 
+    /**
+     * With a non-empty context, pops the innermost frame and returns there -- and only there
+     * -- carrying whatever frames remain as the returned-to node's own context, so a further
+     * return (if this whole chain is itself nested inside more callers) keeps unwinding
+     * precisely up to the depth cap. An empty context (source-originating return, or context
+     * already fully consumed) falls back to broadcasting to every known call site of this
+     * method, same as a fully context-insensitive analysis.
+     */
+    private List<NodeRef> returnTargets(NodeRef current) {
+        if (current.context().isEmpty()) {
+            return callSitesByCallee.getOrDefault(current.method(), List.of());
+        }
+        NodeRef.CallSite innermost = current.context().get(0);
+        List<NodeRef.CallSite> remaining = current.context().subList(1, current.context().size());
+        return List.of(new NodeRef(innermost.callerMethod(), innermost.callerCallNodeId(), List.copyOf(remaining)));
+    }
+
     private void recordSinkHits(NodeRef argSource, DfgNode callNode, int argumentIndex, MethodKey callee,
                                  Map<NodeRef, NodeRef> cameFrom, Map<NodeRef, TaintedParameter> rootSource,
                                  List<TaintFinding> findings) {
@@ -238,14 +262,22 @@ public class TaintEngine {
             return;
         }
         DfgNode calleeParamNode = calleeDfg.paramNode(argumentIndex);
-        // Depth-1 truncation: the callee's context is exactly this call site, regardless of
-        // whatever context `current` itself was carrying.
-        NodeRef.CallSite context = new NodeRef.CallSite(current.method(), callNode.id());
-        NodeRef calleeRef = new NodeRef(callee, calleeParamNode.id(), context);
+        List<NodeRef.CallSite> newContext = pushContext(current.context(), current.method(), callNode.id());
+        NodeRef calleeRef = new NodeRef(callee, calleeParamNode.id(), newContext);
         if (visited.add(calleeRef)) {
             cameFrom.put(calleeRef, current);
             worklist.add(calleeRef);
         }
+    }
+
+    /** Prepends the new frame and keeps only the {@link NodeRef#MAX_CONTEXT_DEPTH} most recent ones. */
+    private List<NodeRef.CallSite> pushContext(List<NodeRef.CallSite> currentContext, MethodKey callerMethod, int callNodeId) {
+        List<NodeRef.CallSite> newContext = new ArrayList<>();
+        newContext.add(new NodeRef.CallSite(callerMethod, callNodeId));
+        for (int i = 0; i < currentContext.size() && newContext.size() < NodeRef.MAX_CONTEXT_DEPTH; i++) {
+            newContext.add(currentContext.get(i));
+        }
+        return List.copyOf(newContext);
     }
 
     private List<NodeRef> reconstructPath(NodeRef end, Map<NodeRef, NodeRef> cameFrom) {

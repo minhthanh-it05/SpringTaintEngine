@@ -222,4 +222,129 @@ class TaintEngineTest {
         assertEquals(1, findings.size());
         assertEquals(VulnerabilityType.INSECURE_DESERIALIZATION, findings.get(0).sinkRule().vulnerabilityType());
     }
+
+    @Test
+    void analyze_taintFlowsIntoFileInputStreamConstructor_isFlaggedAsPathTraversal() {
+        // The far more common real-world Path Traversal shape than Files.newInputStream(...):
+        // opening a stream directly on an attacker-controlled path via `new FileInputStream(...)`.
+        // Before ObjectCreationExpr was made visible to DfgBuilder, the tainted path never even
+        // reached this node -- it silently vanished from the graph.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { "
+                        + "java.io.InputStream open(@RequestParam String path) throws Exception { "
+                        + "  return new java.io.FileInputStream(path); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        assertEquals(VulnerabilityType.PATH_TRAVERSAL, findings.get(0).sinkRule().vulnerabilityType());
+    }
+
+    @Test
+    void analyze_chainedConstructorThenReceiverCall_stillDetectsReceiverTaintSink() {
+        // new ObjectInputStream(in).readObject() written inline (no intermediate variable) --
+        // exercises both the DfgBuilder fix (the constructed object must be visible as a CALL
+        // node so the chained .readObject() sees it as its receiver) and the CallGraphBuilder
+        // fix (resolving a chained call's scope when the scope is itself a constructor call,
+        // not just a typed variable) together.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { "
+                        + "Object load(@RequestParam java.io.InputStream in) throws Exception { "
+                        + "  return new java.io.ObjectInputStream(in).readObject(); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        assertEquals(VulnerabilityType.INSECURE_DESERIALIZATION, findings.get(0).sinkRule().vulnerabilityType());
+    }
+
+    @Test
+    void analyze_taintFlowsIntoProjectLocalConstructor_reachesASinkInsideIt() {
+        // A project-local class's own constructor is now a jump-able callee too: tainted data
+        // passed into `new Handler(cmd)` and used dangerously inside the constructor body
+        // itself must be visible, not just constructors treated as opaque pass-throughs.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class Handler { "
+                        + "Handler(@RequestParam String cmd) { Runtime.getRuntime().exec(cmd); } }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        assertEquals(VulnerabilityType.COMMAND_INJECTION, findings.get(0).sinkRule().vulnerabilityType());
+        assertEquals("<init>", findings.get(0).sourceMethod().methodName());
+    }
+
+    @Test
+    void analyze_boundedContextSensitivity_avoidsFalsePositiveTwoHopsDeep() {
+        // Two-hop version of the context-sensitivity regression test above: aTainted -> b -> c,
+        // with an unrelated caller dClean also calling b directly into a sink. Under a
+        // depth-1-only context (reset on every call crossing instead of accumulated), b's
+        // RETURN loses track of "this call chain started at aTainted" the moment it crosses the
+        // SECOND method boundary (into c and back), degrading to a broadcast that would
+        // incorrectly flag dClean too even though `safe` is never tainted. Accumulating context
+        // up to NodeRef.MAX_CONTEXT_DEPTH (4) fixes this for chains up to that depth.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class Handler { private java.sql.Statement statement; "
+                        + "String c(String x) { return x; } "
+                        + "String b(String x) { return c(x); } "
+                        + "void aTainted(@RequestParam String x) { b(x); } "
+                        + "String dClean(String safe) throws Exception { "
+                        + "  return statement.executeQuery(b(safe)).toString(); } }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertTrue(findings.stream().noneMatch(f -> f.path().stream()
+                .anyMatch(s -> s.method().methodName().equals("dClean"))));
+    }
+
+    @Test
+    void analyze_pathThroughFilenameUtilsGetName_isSanitizedAndProducesNoFinding() {
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { "
+                        + "java.io.InputStream open(@RequestParam String path) throws Exception { "
+                        + "  String safeName = FilenameUtils.getName(path); "
+                        + "  return new java.io.FileInputStream(safeName); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertTrue(findings.isEmpty());
+    }
+
+    @Test
+    void analyze_taintFlowsIntoJdbcTemplateQueryForMap_isFlaggedAsSqlInjection() {
+        // Found missing by validating this engine against a real deliberately-vulnerable
+        // Spring Boot project (malikashish8/vuln-spring): its SQL Injection used Spring's own
+        // JdbcTemplate, not raw java.sql.Statement, and this engine initially missed it.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class WebController { org.springframework.jdbc.core.JdbcTemplate jdbcTemplate; "
+                        + "void login(@RequestParam String username) { "
+                        + "  String query = \"SELECT * FROM users WHERE username=\" + username; "
+                        + "  jdbcTemplate.queryForMap(query); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        assertEquals(VulnerabilityType.SQL_INJECTION, findings.get(0).sinkRule().vulnerabilityType());
+    }
+
+    @Test
+    void analyze_taintFlowsIntoUrlOpenStream_isFlaggedAsSsrf() {
+        // Also found missing via the same real-project validation: new URL(x).openStream() is
+        // the JDK's pre-RestTemplate SSRF shape, detected via receiver taint through a
+        // constructor chain (same mechanism as the ObjectInputStream deserialization sink).
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class WebController { "
+                        + "String fetch(@RequestParam String url) throws Exception { "
+                        + "  return new java.util.Scanner(new java.net.URL(url).openStream(), \"UTF-8\").next(); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        assertEquals(VulnerabilityType.SSRF, findings.get(0).sinkRule().vulnerabilityType());
+    }
 }

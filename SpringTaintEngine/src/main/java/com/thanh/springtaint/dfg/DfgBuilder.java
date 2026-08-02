@@ -1,6 +1,8 @@
 package com.thanh.springtaint.dfg;
 
 import com.github.javaparser.ast.NodeList;
+import com.github.javaparser.ast.body.BodyDeclaration;
+import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.VariableDeclarator;
@@ -9,6 +11,7 @@ import com.github.javaparser.ast.expr.ConditionalExpr;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.LambdaExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.expr.SwitchExpr;
 import com.github.javaparser.ast.stmt.BlockStmt;
 import com.github.javaparser.ast.stmt.CatchClause;
@@ -56,18 +59,29 @@ public class DfgBuilder {
     private Map<String, DfgNode> currentDefs;
 
     public DataFlowGraph build(MethodDeclaration method) {
+        return buildFrom(method.getParameters(), method.getBody().orElse(null));
+    }
+
+    /** Same intraprocedural analysis, for a constructor body -- see {@link #evaluateObjectCreation}. */
+    public DataFlowGraph build(ConstructorDeclaration constructor) {
+        return buildFrom(constructor.getParameters(), constructor.getBody());
+    }
+
+    private DataFlowGraph buildFrom(NodeList<Parameter> parameters, BlockStmt body) {
         nodes = new ArrayList<>();
         edges = new ArrayList<>();
         nextId = 0;
         currentDefs = new LinkedHashMap<>();
 
-        for (Parameter parameter : method.getParameters()) {
+        for (Parameter parameter : parameters) {
             String name = parameter.getNameAsString();
             DfgNode paramNode = newNode(DfgNode.Kind.PARAM, name, name);
             currentDefs.put(name, paramNode);
         }
 
-        method.getBody().ifPresent(body -> processStatements(body.getStatements()));
+        if (body != null) {
+            processStatements(body.getStatements());
+        }
 
         return new DataFlowGraph(List.copyOf(nodes), List.copyOf(edges));
     }
@@ -225,6 +239,9 @@ public class DfgBuilder {
         if (expr.isLambdaExpr()) {
             return evaluateLambda(expr.asLambdaExpr());
         }
+        if (expr.isObjectCreationExpr()) {
+            return evaluateObjectCreation(expr.asObjectCreationExpr());
+        }
         return null;
     }
 
@@ -283,13 +300,66 @@ public class DfgBuilder {
             return evaluate(body.asExpressionStmt().getExpression());
         }
         if (body.isBlockStmt()) {
-            for (Statement stmt : body.asBlockStmt().getStatements()) {
-                if (stmt.isExpressionStmt()) {
-                    evaluate(stmt.asExpressionStmt().getExpression());
-                }
-            }
+            walkSafeBlockBody(body.asBlockStmt());
         }
         return null;
+    }
+
+    /**
+     * A constructor call is treated like a method call for taint purposes: its own arguments
+     * flow into it (so e.g. {@code new FileInputStream(taintedPath)} can be matched directly
+     * as a sink -- see {@link com.thanh.springtaint.rules.SinkCatalog}), and the resulting
+     * CALL node stands for "the constructed object" so a chained call on it
+     * ({@code new ObjectInputStream(x).readObject()}) still sees the receiver as tainted when
+     * {@code x} was. This reuses {@code Kind.CALL} rather than a separate node kind so
+     * CallGraphBuilder/TaintEngine need no extra kind-specific handling -- CallGraphBuilder
+     * emits a matching {@code CallGraphEdge} for the same call-site text, keyed by the JVM's
+     * own constructor-name convention ({@code "<init>"}), which is also how a project-local
+     * class's own constructor becomes a jump-able callee.
+     *
+     * When the expression has an anonymous class body ({@code new Runnable() { ... }}), every
+     * method declared in it is also walked, using the same safe subset as block-bodied lambdas
+     * (top-level {@code ExpressionStmt} only -- see {@link #evaluateLambda}'s javadoc for why),
+     * so taint already in scope via closure capture and used directly inside the body is still
+     * visible (e.g. {@code new Runnable() { public void run() { sink(taintedOuterVar); } } }).
+     * A framework dispatching into the callback later (Spring's {@code JdbcTemplate} calling a
+     * {@code RowMapper}, for instance) is not a call site this engine's static call graph can
+     * see at all, with or without this -- that's a fundamentally different, much larger
+     * problem (modeling specific frameworks' reflective dispatch) that no purely syntactic/CHA
+     * engine can solve generically.
+     */
+    private DfgNode evaluateObjectCreation(ObjectCreationExpr newExpr) {
+        DfgNode node = newNode(DfgNode.Kind.CALL, null, newExpr.toString());
+        NodeList<Expression> arguments = newExpr.getArguments();
+        for (int i = 0; i < arguments.size(); i++) {
+            linkIfPresent(evaluate(arguments.get(i)), node, "arg" + i);
+        }
+        newExpr.getAnonymousClassBody().ifPresent(this::walkAnonymousClassBody);
+        return node;
+    }
+
+    private void walkAnonymousClassBody(NodeList<BodyDeclaration<?>> body) {
+        for (BodyDeclaration<?> member : body) {
+            if (member.isMethodDeclaration()) {
+                member.asMethodDeclaration().getBody().ifPresent(this::walkSafeBlockBody);
+            }
+        }
+    }
+
+    /**
+     * Walks only top-level {@code ExpressionStmt} statements of a block: a {@code return}
+     * (or anything nested inside if/while/etc.) is deliberately left unwalked here rather
+     * than modeled incorrectly, since this builder has no separate RETURN-node kind for "this
+     * lambda/anonymous method's own return" versus "the enclosing method's return" -- reusing
+     * Kind.RETURN would make the taint engine wrongly treat it as the latter and jump taint
+     * back into every one of the enclosing method's own callers.
+     */
+    private void walkSafeBlockBody(BlockStmt block) {
+        for (Statement stmt : block.getStatements()) {
+            if (stmt.isExpressionStmt()) {
+                evaluate(stmt.asExpressionStmt().getExpression());
+            }
+        }
     }
 
     private DfgNode evaluateMethodCall(MethodCallExpr call) {

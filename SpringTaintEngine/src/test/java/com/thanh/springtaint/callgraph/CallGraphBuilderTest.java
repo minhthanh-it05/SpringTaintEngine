@@ -17,6 +17,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CallGraphBuilderTest {
 
+    static {
+        // Record syntax below needs JavaParser's language level bumped past its ancient
+        // default -- JavaParserService's static initializer does that globally, but this class
+        // must not depend on some other test class happening to load it first (real Surefire
+        // runs classes in an order that isn't source-file order, unlike this repo's hand-rolled
+        // JUnit Platform Launcher runner -- this exact fragility only surfaced under `mvn test`).
+        new JavaParserService();
+    }
+
     @Test
     void build_implicitThisCall_resolvesToSameClass() {
         CompilationUnit unit = StaticJavaParser.parse(
@@ -178,5 +187,45 @@ class CallGraphBuilderTest {
         MethodKey callee = new MethodKey("Status", "describe", 0);
         assertTrue(graph.edges().stream().anyMatch(e -> e.caller().equals(caller) && e.callee().equals(callee)));
         assertFalse(graph.isExternal(callee));
+    }
+
+    @Test
+    void build_constructorCall_isRecordedWithInitAsTheMethodName() {
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class Foo { void run(String path) { new java.io.File(path); } }");
+
+        CallGraph graph = new CallGraphBuilder().build(List.of(unit));
+
+        MethodKey callee = new MethodKey("File", MethodKey.CONSTRUCTOR_METHOD_NAME, 1);
+        assertTrue(graph.edges().stream().anyMatch(e -> e.callee().equals(callee)));
+        assertTrue(graph.isExternal(callee));
+    }
+
+    @Test
+    void build_chainedConstructorThenMethodCall_resolvesReceiverToTheConstructedType() {
+        // new java.io.File("x").exists(): the scope of .exists() is itself a constructor call,
+        // not a typed variable -- without ObjectCreationExpr support in resolveScopeClass this
+        // used to fall back to the unknown-class "?" marker.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class Foo { void run() { new java.io.File(\"x\").exists(); } }");
+
+        CallGraph graph = new CallGraphBuilder().build(List.of(unit));
+
+        MethodKey callee = new MethodKey("File", "exists", 0);
+        assertTrue(graph.edges().stream().anyMatch(e -> e.callee().equals(callee)));
+    }
+
+    @Test
+    void build_projectLocalConstructor_isIndexedAndCanItselfBeACaller() {
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class Foo { Foo(String cmd) { helper(cmd); } void helper(String cmd) { } }");
+
+        CallGraph graph = new CallGraphBuilder().build(List.of(unit));
+
+        MethodKey constructorKey = new MethodKey("Foo", MethodKey.CONSTRUCTOR_METHOD_NAME, 1);
+        MethodKey helperKey = new MethodKey("Foo", "helper", 1);
+        assertFalse(graph.isExternal(constructorKey));
+        assertTrue(graph.edges().stream()
+                .anyMatch(e -> e.caller().equals(constructorKey) && e.callee().equals(helperKey)));
     }
 }

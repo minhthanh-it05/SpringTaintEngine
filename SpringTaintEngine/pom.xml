@@ -24,7 +24,7 @@
 
         <!--
             Optional, best-effort symbol resolution used only for whole-project scans
-            (JavaParserService#parseDirectory) -- ground-truth type/overload resolution when it
+            (JavaParserService#parseDirectory): ground-truth type/overload resolution when it
             can succeed (JDK types via reflection, project-local types via the scanned source
             tree), syntactic fallback in CallGraphBuilder when it can't (missing classpath
             jars, unresolved generics, external library types). Single-file/string parsing used

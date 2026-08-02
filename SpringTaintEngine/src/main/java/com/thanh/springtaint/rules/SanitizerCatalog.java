@@ -34,7 +34,38 @@ public class SanitizerCatalog {
 
                 // URL-encoding a value before it reaches an outbound request/path defeats
                 // SSRF/path-traversal payloads that rely on unescaped separators.
-                new SanitizerRule("URLEncoder", "encode", 0, "URL-encodes special characters, defeating SSRF/path payloads")
+                new SanitizerRule("URLEncoder", "encode", 0, "URL-encodes special characters, defeating SSRF/path payloads"),
+
+                // Apache Commons Text/Lang3's escaping helpers -- widely used in real Spring
+                // Boot code as the manual fix for XSS/SQLi when a prepared statement or
+                // templating engine's own auto-escaping isn't in play.
+                new SanitizerRule("StringEscapeUtils", "escapeHtml4", 0, "HTML-encodes special characters, defeating XSS"),
+                new SanitizerRule("StringEscapeUtils", "escapeSql", 0, "Escapes SQL metacharacters, defeating SQL Injection"),
+
+                // Jsoup's HTML sanitizer -- strips dangerous markup/attributes rather than just
+                // escaping, the common choice when the output legitimately needs to allow some
+                // HTML (e.g. a rich-text comment field) instead of encoding everything.
+                new SanitizerRule("Jsoup", "clean", 0, "Strips dangerous markup/attributes, defeating XSS"),
+
+                // Takes just the filename component, discarding any directory traversal
+                // segments ("../") -- the standard Apache Commons IO fix for Path Traversal.
+                new SanitizerRule("FilenameUtils", "getName", 0, "Strips directory components, defeating Path Traversal"),
+
+                // UUID coercion: same "structurally can't carry a payload after this" effect as
+                // the numeric coercions above, for the common case of an id that should have
+                // been a UUID all along.
+                new SanitizerRule("UUID", "fromString", 0, "UUID coercion neutralizes injection payloads")
+
+                // Deliberately NOT included:
+                // - StringUtils.isNumeric / Pattern.matches and other validator-style checks:
+                //   these return a boolean used in an `if`, they don't transform the value --
+                //   and this engine is flow-insensitive across branches (see DfgBuilder's
+                //   javadoc), so there is no reliable way to say "only the validated branch is
+                //   safe" yet. Modeling them as sanitizers here would create false negatives
+                //   (silently trusting a value whose validation branch was never actually taken).
+                // - Paths.get(...): parses a string into a Path object but does NOT strip "..";
+                //   traversal segments survive unchanged. Adding it would be a dangerous FALSE
+                //   sanitizer that actively defeats Path Traversal detection instead of fixing it.
         ));
     }
 

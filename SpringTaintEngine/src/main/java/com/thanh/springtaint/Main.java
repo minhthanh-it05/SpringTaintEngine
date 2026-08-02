@@ -49,7 +49,8 @@ import java.util.Set;
  *                                   every parsed method (the M1-M6 milestone-inspection view)
  *   --help
  */
-public class Main {
+public class
+Main {
 
     public static void main(String[] args) throws IOException {
         if (containsHelp(args)) {

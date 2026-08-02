@@ -1,7 +1,9 @@
 package com.thanh.springtaint.callgraph;
 
 import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.CallableDeclaration;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
@@ -9,6 +11,7 @@ import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.resolution.declarations.ResolvedMethodDeclaration;
 
@@ -64,10 +67,17 @@ import java.util.Set;
  * dropped.
  *
  * Classes are matched by simple name only (no import/package resolution), and
- * overloads are disambiguated only by argument count, not by type. Constructor
- * calls ({@code new Foo()}) are not tracked yet. These are the same kind of
- * deferred-precision trade-offs already made in CfgBuilder/DfgBuilder, to keep the
- * engine running end-to-end before tightening accuracy.
+ * overloads are disambiguated only by argument count, not by type. These are the same
+ * kind of deferred-precision trade-offs already made in CfgBuilder/DfgBuilder, to keep
+ * the engine running end-to-end before tightening accuracy.
+ *
+ * Constructor calls ({@code new Foo(x)}) are tracked the same way method calls are: the
+ * callee is keyed as {@code MethodKey(className, "<init>", argCount)}, mirroring the JVM's
+ * own constructor-naming convention. A project-local class's own constructors are indexed
+ * as callers too (so a constructor that itself calls something dangerous is visible), but
+ * -- unlike method calls -- constructor resolution is never symbol-solved and never goes
+ * through the interface/abstract dispatch fan-out above: {@code new Foo()} is never
+ * polymorphic, it always constructs exactly the named type, so neither is needed.
  */
 public class CallGraphBuilder {
 
@@ -78,8 +88,8 @@ public class CallGraphBuilder {
         Map<String, List<String>> subtypesBySupertype = new HashMap<>();
         Set<MethodKey> declaredMethods = new LinkedHashSet<>();
         Map<MethodKey, MethodDeclaration> methodDeclarationsByKey = new HashMap<>();
-        List<MethodDeclaration> allMethods = new ArrayList<>();
-        Map<MethodDeclaration, String> classNameByMethod = new HashMap<>();
+        List<CallableDeclaration<?>> callables = new ArrayList<>();
+        Map<CallableDeclaration<?>, String> classNameByCallable = new HashMap<>();
 
         for (CompilationUnit unit : units) {
             for (TypeDeclaration<?> typeDecl : unit.findAll(TypeDeclaration.class)) {
@@ -91,24 +101,39 @@ public class CallGraphBuilder {
                     MethodKey key = new MethodKey(className, method.getNameAsString(), method.getParameters().size());
                     declaredMethods.add(key);
                     methodDeclarationsByKey.put(key, method);
-                    allMethods.add(method);
-                    classNameByMethod.put(method, className);
+                    callables.add(method);
+                    classNameByCallable.put(method, className);
+                }
+
+                if (typeDecl instanceof ClassOrInterfaceDeclaration classOrInterface) {
+                    for (ConstructorDeclaration constructor : classOrInterface.getConstructors()) {
+                        MethodKey key = new MethodKey(className, MethodKey.CONSTRUCTOR_METHOD_NAME, constructor.getParameters().size());
+                        declaredMethods.add(key);
+                        callables.add(constructor);
+                        classNameByCallable.put(constructor, className);
+                    }
                 }
             }
         }
 
         List<CallGraphEdge> edges = new ArrayList<>();
-        for (MethodDeclaration method : allMethods) {
-            String className = classNameByMethod.get(method);
-            MethodKey caller = new MethodKey(className, method.getNameAsString(), method.getParameters().size());
-            Map<String, String> localTypes = localTypes(method, fieldTypesByClass.get(className));
+        for (CallableDeclaration<?> callable : callables) {
+            String className = classNameByCallable.get(callable);
+            String methodName = callable instanceof ConstructorDeclaration
+                    ? MethodKey.CONSTRUCTOR_METHOD_NAME
+                    : callable.getNameAsString();
+            MethodKey caller = new MethodKey(className, methodName, callable.getParameters().size());
+            Map<String, String> localTypes = localTypes(callable, fieldTypesByClass.get(className));
 
-            for (MethodCallExpr call : method.findAll(MethodCallExpr.class)) {
+            for (MethodCallExpr call : callable.findAll(MethodCallExpr.class)) {
                 MethodKey primary = resolveCallee(call, className, localTypes);
                 for (MethodKey callee : resolveDispatchTargets(primary, declaredMethods, methodDeclarationsByKey,
                         subtypesBySupertype)) {
                     edges.add(new CallGraphEdge(caller, callee, call.toString()));
                 }
+            }
+            for (ObjectCreationExpr newExpr : callable.findAll(ObjectCreationExpr.class)) {
+                edges.add(new CallGraphEdge(caller, resolveConstructorCallee(newExpr), newExpr.toString()));
             }
         }
 
@@ -180,18 +205,27 @@ public class CallGraphBuilder {
         return fieldTypes;
     }
 
-    private Map<String, String> localTypes(MethodDeclaration method, Map<String, String> fieldTypes) {
+    private Map<String, String> localTypes(CallableDeclaration<?> callable, Map<String, String> fieldTypes) {
         Map<String, String> localTypes = new HashMap<>();
         if (fieldTypes != null) {
             localTypes.putAll(fieldTypes);
         }
-        for (Parameter parameter : method.getParameters()) {
+        for (Parameter parameter : callable.getParameters()) {
             localTypes.put(parameter.getNameAsString(), simpleTypeName(parameter.getType().asString()));
         }
-        for (VariableDeclarator variable : method.findAll(VariableDeclarator.class)) {
+        for (VariableDeclarator variable : callable.findAll(VariableDeclarator.class)) {
             localTypes.put(variable.getNameAsString(), simpleTypeName(variable.getType().asString()));
         }
         return localTypes;
+    }
+
+    /**
+     * {@code new Foo(a, b)} always constructs exactly {@code Foo} -- no dispatch ambiguity,
+     * so (unlike {@link #resolveCallee}) this never needs symbol resolution or CHA fan-out.
+     */
+    private MethodKey resolveConstructorCallee(ObjectCreationExpr newExpr) {
+        String className = simpleTypeName(newExpr.getType().asString());
+        return new MethodKey(className, MethodKey.CONSTRUCTOR_METHOD_NAME, newExpr.getArguments().size());
     }
 
     private MethodKey resolveCallee(MethodCallExpr call, String callerClassName, Map<String, String> localTypes) {
@@ -242,6 +276,11 @@ public class CallGraphBuilder {
                 return type;
             }
             return Character.isUpperCase(name.charAt(0)) ? name : UNKNOWN_CLASS;
+        }
+        if (scope.isObjectCreationExpr()) {
+            // Chained construct-then-call, e.g. `new ObjectInputStream(in).readObject()`: the
+            // constructed type is right there syntactically, no variable lookup needed.
+            return simpleTypeName(scope.asObjectCreationExpr().getType().asString());
         }
         return UNKNOWN_CLASS;
     }

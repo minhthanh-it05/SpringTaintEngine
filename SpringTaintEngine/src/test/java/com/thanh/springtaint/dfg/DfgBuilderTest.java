@@ -199,6 +199,56 @@ class DfgBuilderTest {
         assertTrue(dfg.nodes().stream().noneMatch(n -> n.kind() == DfgNode.Kind.RETURN));
     }
 
+    @Test
+    void build_constructorCall_isVisibleAsACallNodeLinkedFromItsArguments() {
+        // Before ObjectCreationExpr was handled in evaluate(), `new java.io.File(path)` was
+        // invisible to the DFG entirely -- `path` never linked to anything, and taint through
+        // any constructor call silently vanished.
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run(String path) { java.io.File f = new java.io.File(path); }");
+
+        DataFlowGraph dfg = new DfgBuilder().build(method);
+
+        DfgNode path = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.PARAM && "path".equals(n.variableName()))
+                .findFirst().orElseThrow();
+        DfgNode constructorCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().contains("new java.io.File"))
+                .findFirst().orElseThrow();
+
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(path) && e.to().equals(constructorCall) && "arg0".equals(e.label())));
+    }
+
+    @Test
+    void build_anonymousClassBody_evaluatesTopLevelStatementsAgainstTheEnclosingScope() {
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run(String id) { Runnable r = new Runnable() { public void run() { sink(id); } }; }");
+
+        DataFlowGraph dfg = new DfgBuilder().build(method);
+
+        DfgNode id = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.PARAM && "id".equals(n.variableName()))
+                .findFirst().orElseThrow();
+        DfgNode sinkCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("sink"))
+                .findFirst().orElseThrow();
+
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(id) && e.to().equals(sinkCall) && "arg0".equals(e.label())));
+    }
+
+    @Test
+    void build_anonymousClassMethodReturn_isNotMisreportedAsTheEnclosingMethodsReturn() {
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run() { java.util.Comparator<String> c = new java.util.Comparator<String>() { "
+                        + "public int compare(String a, String b) { return 0; } }; }");
+
+        DataFlowGraph dfg = new DfgBuilder().build(method);
+
+        assertTrue(dfg.nodes().stream().noneMatch(n -> n.kind() == DfgNode.Kind.RETURN));
+    }
+
     private static DfgNode nodeFor(DataFlowGraph dfg, String variableName) {
         return dfg.nodes().stream()
                 .filter(n -> n.kind() == DfgNode.Kind.ASSIGN && variableName.equals(n.variableName()))

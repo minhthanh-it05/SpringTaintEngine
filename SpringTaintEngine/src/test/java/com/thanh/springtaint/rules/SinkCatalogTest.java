@@ -41,6 +41,30 @@ class SinkCatalogTest {
     }
 
     @Test
+    void isSink_matchesJdbcTemplateQueryForMapOnArgumentZero() {
+        // Spring's own JdbcTemplate -- the standard, idiomatic Spring Boot JDBC API, far more
+        // common in real code than raw java.sql.Statement above.
+        SinkCatalog catalog = SinkCatalog.defaults();
+        MethodKey queryForMap = new MethodKey("JdbcTemplate", "queryForMap", 1);
+
+        assertTrue(catalog.isSink(queryForMap));
+        assertEquals(VulnerabilityType.SQL_INJECTION, catalog.match(queryForMap).get(0).vulnerabilityType());
+    }
+
+    @Test
+    void isSink_matchesUrlOpenStreamOnItsReceiver() {
+        // new URL(x).openStream(): the JDK's own pre-RestTemplate SSRF shape -- the danger is
+        // the receiver (built from the tainted URL string), not an argument.
+        SinkCatalog catalog = SinkCatalog.defaults();
+        MethodKey openStream = new MethodKey("URL", "openStream", 0);
+
+        assertTrue(catalog.isSink(openStream));
+        SinkRule rule = catalog.match(openStream).get(0);
+        assertEquals(VulnerabilityType.SSRF, rule.vulnerabilityType());
+        assertTrue(rule.isArgumentTainted(SinkRule.RECEIVER_INDEX));
+    }
+
+    @Test
     void isSink_unrelatedMethodDoesNotMatch() {
         SinkCatalog catalog = SinkCatalog.defaults();
 
