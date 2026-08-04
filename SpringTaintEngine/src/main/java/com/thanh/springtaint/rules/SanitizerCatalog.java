@@ -41,6 +41,11 @@ public class SanitizerCatalog {
                 // templating engine's own auto-escaping isn't in play.
                 new SanitizerRule("StringEscapeUtils", "escapeHtml4", 0, "HTML-encodes special characters, defeating XSS"),
                 new SanitizerRule("StringEscapeUtils", "escapeSql", 0, "Escapes SQL metacharacters, defeating SQL Injection"),
+                // Pre-3.x Apache Commons Lang used "escapeHtml" (no "4" suffix) -- still shows
+                // up in real/legacy code. Surfaced by a 50-case OWASP Benchmark run: fixing the
+                // null-guard idiom bug let taint reach this call for the first time, exposing
+                // that only the commons-lang3 method name was registered.
+                new SanitizerRule("StringEscapeUtils", "escapeHtml", 0, "HTML-encodes special characters, defeating XSS"),
 
                 // Jsoup's HTML sanitizer -- strips dangerous markup/attributes rather than just
                 // escaping, the common choice when the output legitimately needs to allow some

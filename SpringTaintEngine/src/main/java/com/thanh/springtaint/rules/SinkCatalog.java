@@ -24,7 +24,17 @@ public class SinkCatalog {
                         VulnerabilityType.SQL_INJECTION, "JDBC Statement.execute(sql)"),
                 new SinkRule("Connection", "prepareStatement", Set.of(0),
                         VulnerabilityType.SQL_INJECTION, "JDBC Connection.prepareStatement(sql)"),
-                new SinkRule(null, "exec", Set.of(0),
+                // Same idea as prepareStatement, for CallableStatement's stored-procedure
+                // equivalent ({call ...}). Discovered missing by running this engine against a
+                // broader OWASP Benchmark sample -- a real SQLi test case used exactly this API.
+                new SinkRule("Connection", "prepareCall", Set.of(0),
+                        VulnerabilityType.SQL_INJECTION, "JDBC Connection.prepareCall(sql)"),
+                // Empty set = every argument position is sink-relevant, not just index 0: real
+                // overloads include exec(String[] cmdarray, String[] envp) where the tainted
+                // value can land in the *second* argument (the environment array), which a
+                // fixed arg-0-only rule would silently miss. Discovered missing by running this
+                // engine against a broader OWASP Benchmark sample (see SinkCatalogTest).
+                new SinkRule(null, "exec", Set.of(),
                         VulnerabilityType.COMMAND_INJECTION, "Runtime.exec(command)"),
                 new SinkRule("RestTemplate", "getForObject", Set.of(0),
                         VulnerabilityType.SSRF, "RestTemplate.getForObject(url)"),

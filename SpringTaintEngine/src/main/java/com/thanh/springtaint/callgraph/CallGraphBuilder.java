@@ -282,6 +282,17 @@ public class CallGraphBuilder {
             // constructed type is right there syntactically, no variable lookup needed.
             return simpleTypeName(scope.asObjectCreationExpr().getType().asString());
         }
+        if (scope.isFieldAccessExpr()) {
+            // A fully-qualified static call, e.g. `org.apache.commons.lang.StringEscapeUtils
+            // .escapeHtml(x)`: JavaParser represents the package-qualified prefix as a chain of
+            // FieldAccessExpr, so the direct scope's own simple name (the last segment before
+            // the method call) IS the class name -- same "starts with an uppercase letter"
+            // convention-based heuristic already used for NameExpr above, which also correctly
+            // avoids misreading a genuine instance field access (e.g. `this.helper.run()`,
+            // conventionally lowercase) as if it were a class name.
+            String name = scope.asFieldAccessExpr().getNameAsString();
+            return Character.isUpperCase(name.charAt(0)) ? name : UNKNOWN_CLASS;
+        }
         return UNKNOWN_CLASS;
     }
 

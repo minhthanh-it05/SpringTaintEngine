@@ -249,6 +249,153 @@ class DfgBuilderTest {
         assertTrue(dfg.nodes().stream().noneMatch(n -> n.kind() == DfgNode.Kind.RETURN));
     }
 
+    @Test
+    void build_ifWithoutElse_mergesPriorValueWithBranchAssignedValue() {
+        // Regression test: "if (param == null) param = \"\";" is an extremely common real-world
+        // null-guard idiom. Before the branch-merge fix, walking into the if-body simply
+        // overwrote currentDefs["param"] with the safe literal, permanently severing every
+        // later use of `param` from the original tainted PARAM node -- a silent false negative
+        // with no exception, no warning, just a missed vulnerability.
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run(String param) { if (param == null) { param = \"\"; } sink(param); }");
+
+        DataFlowGraph dfg = new DfgBuilder().build(method);
+
+        DfgNode param = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.PARAM && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+        DfgNode sinkCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("sink"))
+                .findFirst().orElseThrow();
+        DfgNode merge = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.MERGE && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+
+        assertTrue(dfg.edges().stream().anyMatch(e -> e.from().equals(param) && e.to().equals(merge)));
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(merge) && e.to().equals(sinkCall) && "arg0".equals(e.label())));
+    }
+
+    @Test
+    void build_classicSwitchCase_mergesEveryCaseIntoTheUseAfterTheSwitch() {
+        // Same root cause as the if-without-else case above, for old-style switch: before the
+        // fix, every case body shared one map with no merge at the end, so whichever case was
+        // walked LAST (textually, regardless of which one actually runs) silently won.
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run(String param, char c) { String bar; "
+                        + "switch (c) { case 'A': bar = param; break; default: bar = \"safe\"; break; } "
+                        + "sink(bar); }");
+
+        DataFlowGraph dfg = new DfgBuilder().build(method);
+
+        DfgNode param = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.PARAM && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+        DfgNode sinkCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("sink"))
+                .findFirst().orElseThrow();
+        DfgNode merge = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.MERGE && "bar".equals(n.variableName()))
+                .findFirst().orElseThrow();
+        // param -> (bar = param) -> merge -> sink(bar): "bar" is a different variable than
+        // "param", so the tainted case's assignment is an intermediate ASSIGN node, not param
+        // itself, feeding into the merge.
+        DfgNode caseAssign = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.ASSIGN && "bar".equals(n.variableName())
+                        && "bar = param".equals(n.label()))
+                .findFirst().orElseThrow();
+
+        assertTrue(dfg.edges().stream().anyMatch(e -> e.from().equals(param) && e.to().equals(caseAssign)));
+        assertTrue(dfg.edges().stream().anyMatch(e -> e.from().equals(caseAssign) && e.to().equals(merge)));
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(merge) && e.to().equals(sinkCall) && "arg0".equals(e.label())));
+    }
+
+    @Test
+    void build_listAddThenGet_linksThroughTheCollectionVariable() {
+        // list.add(param) then list.get(0): this builder has no notion of element indices, so
+        // the whole `list` variable's reaching definition becomes the add(...) call (which
+        // already links the prior collection value and the new argument) -- coarse, but sound.
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run(String param) { java.util.List<String> list = new java.util.ArrayList<>(); "
+                        + "list.add(param); sink(list.get(0)); }");
+
+        DataFlowGraph dfg = new DfgBuilder().build(method);
+
+        DfgNode param = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.PARAM && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+        DfgNode addCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("list.add"))
+                .findFirst().orElseThrow();
+        DfgNode getCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("list.get"))
+                .findFirst().orElseThrow();
+        DfgNode sinkCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("sink"))
+                .findFirst().orElseThrow();
+
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(param) && e.to().equals(addCall) && "arg0".equals(e.label())));
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(addCall) && e.to().equals(getCall) && "receiver".equals(e.label())));
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(getCall) && e.to().equals(sinkCall) && "arg0".equals(e.label())));
+    }
+
+    @Test
+    void build_stringBuilderAppend_linksThroughTheBuilderVariable() {
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run(String param) { StringBuilder sb = new StringBuilder(); "
+                        + "sb.append(param); sink(sb.toString()); }");
+
+        DataFlowGraph dfg = new DfgBuilder().build(method);
+
+        DfgNode param = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.PARAM && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+        DfgNode appendCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("sb.append"))
+                .findFirst().orElseThrow();
+        DfgNode toStringCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("sb.toString"))
+                .findFirst().orElseThrow();
+
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(param) && e.to().equals(appendCall) && "arg0".equals(e.label())));
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(appendCall) && e.to().equals(toStringCall) && "receiver".equals(e.label())));
+    }
+
+    @Test
+    void build_newArrayWithInitializer_linksThroughEveryElement() {
+        // `new String[] {a, param}` is ArrayCreationExpr, a distinct JavaParser node from the
+        // bare `{a, param}` ArrayInitializerExpr already handled elsewhere -- found missing via
+        // a second 50-case OWASP Benchmark run: Runtime.exec's array-of-args overload builds its
+        // arguments exactly this way.
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run(String param) { String[] args = new String[] { \"echo\", param }; sink(args); }");
+
+        DataFlowGraph dfg = new DfgBuilder().build(method);
+
+        DfgNode param = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.PARAM && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+        DfgNode args = nodeFor(dfg, "args");
+        DfgNode sinkCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("sink"))
+                .findFirst().orElseThrow();
+
+        DfgNode merge = dfg.edges().stream()
+                .filter(e -> e.from().equals(param))
+                .map(DfgEdge::to)
+                .findFirst().orElseThrow();
+        assertEquals(DfgNode.Kind.EXPRESSION, merge.kind());
+        assertTrue(dfg.edges().stream().anyMatch(e -> e.from().equals(merge) && e.to().equals(args)));
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(args) && e.to().equals(sinkCall) && "arg0".equals(e.label())));
+    }
+
     private static DfgNode nodeFor(DataFlowGraph dfg, String variableName) {
         return dfg.nodes().stream()
                 .filter(n -> n.kind() == DfgNode.Kind.ASSIGN && variableName.equals(n.variableName()))

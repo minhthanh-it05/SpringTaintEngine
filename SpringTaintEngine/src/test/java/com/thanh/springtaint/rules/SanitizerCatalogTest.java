@@ -39,6 +39,15 @@ class SanitizerCatalogTest {
     }
 
     @Test
+    void sanitizes_matchesPre3xApacheCommonsLangEscapeHtmlWithoutTheFourSuffix() {
+        // Legacy org.apache.commons.lang.StringEscapeUtils.escapeHtml (no "4" suffix, distinct
+        // from the commons-lang3 escapeHtml4 above) -- still shows up in real/legacy code.
+        SanitizerCatalog catalog = SanitizerCatalog.defaults();
+
+        assertTrue(catalog.sanitizes(new MethodKey("StringEscapeUtils", "escapeHtml", 1), 0));
+    }
+
+    @Test
     void sanitizes_matchesFilenameUtilsGetNameAndUuidFromString() {
         SanitizerCatalog catalog = SanitizerCatalog.defaults();
 

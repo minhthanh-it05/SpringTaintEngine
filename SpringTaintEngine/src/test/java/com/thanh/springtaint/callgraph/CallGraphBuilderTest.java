@@ -82,6 +82,23 @@ class CallGraphBuilderTest {
     }
 
     @Test
+    void build_fullyQualifiedStaticCall_resolvesToTheClassNameNotUnknown() {
+        // org.apache.commons.lang.StringEscapeUtils.escapeHtml(x): JavaParser represents the
+        // package-qualified prefix as a chain of FieldAccessExpr, not a plain NameExpr -- before
+        // resolveScopeClass handled FieldAccessExpr, this fell back to the unknown-class
+        // wildcard "?", which meant SanitizerCatalog's exact class-name match could never fire
+        // for any fully-qualified sanitizer/sink call, however common those are in real code.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class Foo { void run(String x) { "
+                        + "org.apache.commons.lang.StringEscapeUtils.escapeHtml(x); } }");
+
+        CallGraph graph = new CallGraphBuilder().build(List.of(unit));
+
+        MethodKey callee = new MethodKey("StringEscapeUtils", "escapeHtml", 1);
+        assertTrue(graph.edges().stream().anyMatch(e -> e.callee().equals(callee)));
+    }
+
+    @Test
     void build_chainedCallWithUnresolvableScope_marksCalleeClassUnknown() {
         CompilationUnit unit = StaticJavaParser.parse(
                 "class Foo { Object a() { return null; } void run() { a().toString(); } }");

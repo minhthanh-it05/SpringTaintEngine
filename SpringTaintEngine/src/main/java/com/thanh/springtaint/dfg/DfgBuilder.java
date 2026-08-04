@@ -26,8 +26,10 @@ import com.github.javaparser.ast.stmt.YieldStmt;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Builds an intraprocedural Data Flow Graph for a single method: which variables'
@@ -35,21 +37,35 @@ import java.util.Map;
  * return expression.
  *
  * Simplifications (deferred, not yet handled):
- * - Flow-insensitive across branches: if/else, loop bodies, and try/catch/finally are
- *   all walked in source order sharing one reaching-definition map, so a definition
- *   made only inside one branch simply overwrites the map for whatever runs after it
- *   (no merge at join points). Good enough while the engine is being made to run
- *   end-to-end; revisit once M8 taint propagation needs branch-sensitive accuracy.
+ * - Branches (if/else, switch, while/for bodies) are each walked from an independent
+ *   snapshot of the reaching-definition map and then joined at the branch's end (see
+ *   {@link #branchAndMerge}) -- a variable that could hold a different value depending
+ *   on which branch ran becomes a synthetic {@link DfgNode.Kind#MERGE} node linking
+ *   every possibility, rather than one branch's last-assigned value silently
+ *   overwriting every other one. This is still not fully flow-sensitive: branches are
+ *   not aware of which conditions are mutually exclusive or statically impossible
+ *   (e.g. a condition built from constants that always evaluates the same way), and a
+ *   loop body is approximated as "runs zero or one times" (no fixpoint over multiple
+ *   iterations). Good enough for taint reachability, which only needs "could this
+ *   value have come from here", not "which branch definitely ran".
  * - try/catch/finally is walked structurally (try body, every catch body, finally
- *   body all visited) but not control-flow-accurately: a catch clause's exception
- *   parameter (e.g. the {@code e} in {@code catch (SQLException e)}) is never
- *   registered as a tracked variable, so data derived from the caught exception itself
- *   is invisible -- only the case that actually matters for taint (values computed
- *   before an exception could occur, e.g. a tainted query built right before
+ *   body all visited, sharing one map with no merge -- an exception can occur at any
+ *   point inside the try body, so treating every statement after it as unreachable
+ *   would lose real dataflow) but not control-flow-accurately: a catch clause's
+ *   exception parameter (e.g. the {@code e} in {@code catch (SQLException e)}) is
+ *   never registered as a tracked variable, so data derived from the caught exception
+ *   itself is invisible -- only the case that actually matters for taint (values
+ *   computed before an exception could occur, e.g. a tainted query built right before
  *   {@code executeQuery}) is what this fix targets.
  * - No type resolution: variable references are matched purely by identifier name
  *   (JavaSymbolSolver is not wired up), so fields/statics with the same name as a
  *   local are not distinguished.
+ * - Collections/builders are tracked coarsely, not per-element: a call to a known
+ *   mutating method (add/put/append/...) on a simple local-variable receiver makes
+ *   that variable's new reaching definition the call itself (which already links the
+ *   collection's prior value and the new argument) -- see {@link #updateReceiverIfMutating}.
+ *   This means the whole collection is "tainted" the moment anything tainted goes in,
+ *   with no notion of which key/index/element -- sound for reachability, not precise.
  */
 public class DfgBuilder {
 
@@ -120,12 +136,28 @@ public class DfgBuilder {
 
     private void processSwitch(SwitchStmt switchStmt) {
         evaluate(switchStmt.getSelector());
-        // Every case body is walked in source order sharing the same reaching-definition map
-        // as the rest of this builder (no per-branch merge at the join point) -- same
-        // flow-insensitive simplification already applied to if/while/try above.
-        for (SwitchEntry entry : switchStmt.getEntries()) {
-            processStatements(entry.getStatements());
+        List<SwitchEntry> entries = switchStmt.getEntries();
+        if (entries.isEmpty()) {
+            return;
         }
+        List<Runnable> branches = new ArrayList<>();
+        boolean hasDefault = false;
+        for (SwitchEntry entry : entries) {
+            branches.add(() -> processStatements(entry.getStatements()));
+            if (entry.getLabels().isEmpty()) {
+                hasDefault = true;
+            }
+        }
+        if (!hasDefault) {
+            // No case matched is itself a reachable outcome -- an implicit no-op branch so
+            // that outcome's reaching definitions (i.e. "nothing changed") are part of the join.
+            branches.add(() -> { });
+        }
+        // Classic switch fall-through (a case with no `break`) is not modeled: every case's
+        // statements are walked as an independent branch from the pre-switch state, not
+        // chained into the next case. Consistent with this builder's overall bias toward
+        // "sound enough for reachability" over exact control-flow semantics.
+        branchAndMerge(branches);
     }
 
     private void processTry(TryStmt tryStmt) {
@@ -141,13 +173,20 @@ public class DfgBuilder {
 
     private void processIf(IfStmt ifStmt) {
         evaluate(ifStmt.getCondition());
-        processStatement(ifStmt.getThenStmt());
-        ifStmt.getElseStmt().ifPresent(this::processStatement);
+        branchAndMerge(List.of(
+                () -> processStatement(ifStmt.getThenStmt()),
+                () -> ifStmt.getElseStmt().ifPresent(this::processStatement)));
     }
 
     private void processWhile(WhileStmt whileStmt) {
         evaluate(whileStmt.getCondition());
-        processStatement(whileStmt.getBody());
+        // Approximated as "runs zero or one times": a real loop can also run many times, but
+        // the two-branch join (body-once vs. not-at-all) already captures the case that
+        // actually matters for taint -- a value assigned only inside the loop must not
+        // silently overwrite the value that reaches code after the loop when it never ran.
+        branchAndMerge(List.of(
+                () -> processStatement(whileStmt.getBody()),
+                () -> { }));
     }
 
     private void processFor(ForStmt forStmt) {
@@ -155,10 +194,63 @@ public class DfgBuilder {
             processExpressionStatement(init);
         }
         forStmt.getCompare().ifPresent(this::evaluate);
-        processStatement(forStmt.getBody());
-        for (Expression update : forStmt.getUpdate()) {
-            processExpressionStatement(update);
+        branchAndMerge(List.of(
+                () -> {
+                    processStatement(forStmt.getBody());
+                    for (Expression update : forStmt.getUpdate()) {
+                        processExpressionStatement(update);
+                    }
+                },
+                () -> { }));
+    }
+
+    /**
+     * Runs every branch independently from its own snapshot of the current reaching-definition
+     * map, then joins the results at the end: a variable whose value is the exact same node
+     * across every branch keeps that node (nothing to merge -- untouched or touched identically
+     * everywhere); one that diverges gets a synthetic {@link DfgNode.Kind#MERGE} node with an
+     * incoming edge from each distinct value seen, becoming the reaching definition going
+     * forward. Passing a no-op branch (a {@code Runnable} that does nothing) represents "this
+     * alternative leaves everything as it already was" -- how an {@code if} with no
+     * {@code else}, a {@code switch} with no {@code default}, and a loop that might run zero
+     * times are all expressed in terms of this same join.
+     */
+    private void branchAndMerge(List<Runnable> branches) {
+        Map<String, DfgNode> before = currentDefs;
+        List<Map<String, DfgNode>> results = new ArrayList<>();
+        for (Runnable branch : branches) {
+            currentDefs = new LinkedHashMap<>(before);
+            branch.run();
+            results.add(currentDefs);
         }
+        currentDefs = mergeDefs(results);
+    }
+
+    private Map<String, DfgNode> mergeDefs(List<Map<String, DfgNode>> branchResults) {
+        Map<String, DfgNode> merged = new LinkedHashMap<>();
+        Set<String> allVars = new LinkedHashSet<>();
+        for (Map<String, DfgNode> result : branchResults) {
+            allVars.addAll(result.keySet());
+        }
+        for (String variable : allVars) {
+            Set<DfgNode> distinctValues = new LinkedHashSet<>();
+            for (Map<String, DfgNode> result : branchResults) {
+                DfgNode value = result.get(variable);
+                if (value != null) {
+                    distinctValues.add(value);
+                }
+            }
+            if (distinctValues.size() == 1) {
+                merged.put(variable, distinctValues.iterator().next());
+            } else if (distinctValues.size() > 1) {
+                DfgNode mergeNode = newNode(DfgNode.Kind.MERGE, variable, variable + " (merged)");
+                for (DfgNode value : distinctValues) {
+                    linkIfPresent(value, mergeNode, "merge");
+                }
+                merged.put(variable, mergeNode);
+            }
+        }
+        return merged;
     }
 
     private void processExpressionStatement(Expression expr) {
@@ -242,7 +334,37 @@ public class DfgBuilder {
         if (expr.isObjectCreationExpr()) {
             return evaluateObjectCreation(expr.asObjectCreationExpr());
         }
+        if (expr.isArrayInitializerExpr()) {
+            return evaluateArrayInitializer(expr.asArrayInitializerExpr());
+        }
+        if (expr.isArrayCreationExpr()) {
+            // `new String[] {a, b}` is a distinct JavaParser node from the bare `{a, b}` above
+            // (ArrayCreationExpr, not ArrayInitializerExpr) -- e.g. Runtime.exec's
+            // `new String[] {cmd, tainted}` argument shape.
+            return expr.asArrayCreationExpr().getInitializer()
+                    .map(this::evaluateArrayInitializer)
+                    .orElse(null);
+        }
         return null;
+    }
+
+    /**
+     * An array literal ({@code {"echo", cmd}}) merges every element into one node, the same
+     * flow-insensitive join used for binary/ternary/switch expressions above -- this is what
+     * lets taint reach a sink argument built as {@code String[] envp = {tainted};} rather than
+     * passed as a bare variable (e.g. {@code Runtime.exec(cmdarray, envp)}).
+     */
+    private DfgNode evaluateArrayInitializer(com.github.javaparser.ast.expr.ArrayInitializerExpr array) {
+        DfgNode merge = newNode(DfgNode.Kind.EXPRESSION, null, array.toString());
+        boolean anyElementLinked = false;
+        for (Expression element : array.getValues()) {
+            DfgNode value = evaluate(element);
+            if (value != null) {
+                linkIfPresent(value, merge, "element");
+                anyElementLinked = true;
+            }
+        }
+        return anyElementLinked ? merge : null;
     }
 
     private DfgNode evaluateConditional(ConditionalExpr conditional) {
@@ -362,6 +484,17 @@ public class DfgBuilder {
         }
     }
 
+    /**
+     * Method names whose call this builder treats as mutating their receiver in place --
+     * {@code List/Set/Map.add|put|offer|push|addFirst|addLast|addAll|putAll} and
+     * {@code StringBuilder/StringBuffer.append}. Recognized by name alone (no type
+     * resolution), so a project-defined method that happens to share one of these names is
+     * also (harmlessly) treated as mutating; a real mutating call that uses a different name
+     * (e.g. a custom {@code insert(...)}) is not.
+     */
+    private static final Set<String> MUTATING_METHOD_NAMES =
+            Set.of("add", "addAll", "addFirst", "addLast", "put", "putAll", "append", "offer", "push", "set");
+
     private DfgNode evaluateMethodCall(MethodCallExpr call) {
         DfgNode callNode = newNode(DfgNode.Kind.CALL, null, call.toString());
         call.getScope().ifPresent(scope -> linkIfPresent(evaluate(scope), callNode, "receiver"));
@@ -369,7 +502,26 @@ public class DfgBuilder {
         for (int i = 0; i < arguments.size(); i++) {
             linkIfPresent(evaluate(arguments.get(i)), callNode, "arg" + i);
         }
+        updateReceiverIfMutating(call, callNode);
         return callNode;
+    }
+
+    /**
+     * A call like {@code list.add(param)} or {@code sb.append(param)} carries taint into the
+     * collection/builder itself, not just into a value returned from this call -- a later
+     * {@code list.get(0)} or {@code sb.toString()} needs to see it too. Rather than model
+     * List/Map/StringBuilder contents element-by-element (this builder has no notion of
+     * indices or keys at all), the whole receiver variable's reaching definition becomes this
+     * call node, which already links both the collection's prior value (as "receiver") and
+     * the new argument(s) (as "argN") -- so anything read back out of the variable afterward
+     * is conservatively treated as possibly tainted, regardless of which key/index it reads.
+     */
+    private void updateReceiverIfMutating(MethodCallExpr call, DfgNode callNode) {
+        if (!MUTATING_METHOD_NAMES.contains(call.getNameAsString())) {
+            return;
+        }
+        call.getScope().filter(Expression::isNameExpr)
+                .ifPresent(scope -> currentDefs.put(scope.asNameExpr().getNameAsString(), callNode));
     }
 
     private String assignTargetName(AssignExpr assign) {

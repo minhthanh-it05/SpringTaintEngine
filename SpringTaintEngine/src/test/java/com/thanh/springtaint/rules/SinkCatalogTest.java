@@ -65,6 +65,28 @@ class SinkCatalogTest {
     }
 
     @Test
+    void isSink_execFlagsTaintAtAnyArgumentIndexNotJustZero() {
+        // Runtime.exec(String[] cmdarray, String[] envp): the tainted value can land in the
+        // *second* argument (the environment array), not just the command itself at index 0.
+        SinkCatalog catalog = SinkCatalog.defaults();
+        SinkRule rule = catalog.match(new MethodKey("Runtime", "exec", 2)).get(0);
+
+        assertTrue(rule.isArgumentTainted(0));
+        assertTrue(rule.isArgumentTainted(1));
+    }
+
+    @Test
+    void isSink_matchesConnectionPrepareCallOnArgumentZero() {
+        // CallableStatement's stored-procedure equivalent of prepareStatement -- found missing
+        // by validating this engine against a real OWASP Benchmark SQL Injection test case.
+        SinkCatalog catalog = SinkCatalog.defaults();
+        MethodKey prepareCall = new MethodKey("Connection", "prepareCall", 1);
+
+        assertTrue(catalog.isSink(prepareCall));
+        assertEquals(VulnerabilityType.SQL_INJECTION, catalog.match(prepareCall).get(0).vulnerabilityType());
+    }
+
+    @Test
     void isSink_unrelatedMethodDoesNotMatch() {
         SinkCatalog catalog = SinkCatalog.defaults();
 

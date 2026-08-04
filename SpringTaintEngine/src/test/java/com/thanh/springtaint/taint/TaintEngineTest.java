@@ -347,4 +347,120 @@ class TaintEngineTest {
         assertEquals(1, findings.size());
         assertEquals(VulnerabilityType.SSRF, findings.get(0).sinkRule().vulnerabilityType());
     }
+
+    @Test
+    void analyze_nullGuardIdiom_stillDetectsTaintReachingSink() {
+        // Regression test found via a 50-case OWASP Benchmark run: "if (x == null) x = default;"
+        // is an extremely common real-world null-guard idiom. Before the DfgBuilder branch-merge
+        // fix, the reassignment inside the if-body permanently overwrote the reaching definition
+        // for `id`, silently severing it from the tainted @RequestParam -- 6 of 20 false
+        // negatives in that benchmark run traced to exactly this.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { java.sql.Statement statement; "
+                        + "void run(@RequestParam String id) throws Exception { "
+                        + "  if (id == null) { id = \"\"; } "
+                        + "  String query = \"SELECT * FROM users WHERE id = \" + id; "
+                        + "  statement.executeQuery(query); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        assertEquals(VulnerabilityType.SQL_INJECTION, findings.get(0).sinkRule().vulnerabilityType());
+    }
+
+    @Test
+    void analyze_classicSwitchStatement_stillDetectsTaintReachingSink() {
+        // Same root cause as the null-guard case above, for old-style switch (case/break, not
+        // the arrow form): before the fix, whichever case happened to be walked LAST in source
+        // order silently won, regardless of which one actually runs -- this let a safe *default*
+        // branch appearing after the tainted case mask a real vulnerability.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { java.sql.Statement statement; "
+                        + "void run(@RequestParam String id, char c) throws Exception { "
+                        + "  String bar; "
+                        + "  switch (c) { case 'A': bar = id; break; default: bar = \"safe\"; break; } "
+                        + "  statement.executeQuery(bar); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        assertEquals(VulnerabilityType.SQL_INJECTION, findings.get(0).sinkRule().vulnerabilityType());
+    }
+
+    @Test
+    void analyze_taintAddedToListThenRetrieved_reachesSink() {
+        // OWASP Benchmark repeatedly uses List.add(...)/get(...) as an obfuscation step between
+        // source and sink specifically to test whether a tool does real dataflow. Before the
+        // collection-mutation fix, this engine had no notion of collection contents at all.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { java.sql.Statement statement; "
+                        + "void run(@RequestParam String id) throws Exception { "
+                        + "  java.util.List<String> values = new java.util.ArrayList<>(); "
+                        + "  values.add(id); "
+                        + "  statement.executeQuery(values.get(0)); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        assertEquals(VulnerabilityType.SQL_INJECTION, findings.get(0).sinkRule().vulnerabilityType());
+    }
+
+    @Test
+    void analyze_multiArgExec_taintInSecondArgument_isDetected() {
+        // Runtime.exec(String[] cmdarray, String[] envp): the SinkRule for exec used to only
+        // consider argument index 0 dangerous, missing real command injection where the tainted
+        // value lands in the environment array (index 1) instead of the command array itself.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { "
+                        + "void run(@RequestParam String id) throws Exception { "
+                        + "  String[] cmd = {\"echo\"}; "
+                        + "  String[] env = {id}; "
+                        + "  Runtime.getRuntime().exec(cmd, env); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        assertEquals(VulnerabilityType.COMMAND_INJECTION, findings.get(0).sinkRule().vulnerabilityType());
+    }
+
+    @Test
+    void analyze_taintFlowsIntoConnectionPrepareCall_isFlaggedAsSqlInjection() {
+        // Connection.prepareCall(sql) (CallableStatement's stored-procedure equivalent of
+        // prepareStatement) was entirely missing from SinkCatalog -- found via a real OWASP
+        // Benchmark SQL Injection test case using exactly this API.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { "
+                        + "void run(@RequestParam String id, java.sql.Connection connection) throws Exception { "
+                        + "  String sql = \"{call getUser('\" + id + \"')}\"; "
+                        + "  connection.prepareCall(sql); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        assertEquals(VulnerabilityType.SQL_INJECTION, findings.get(0).sinkRule().vulnerabilityType());
+    }
+
+    @Test
+    void analyze_taintInsideNewArrayWithInitializer_reachesExecSink() {
+        // Regression test found via a second 50-case OWASP Benchmark run: `new String[] {cmd,
+        // tainted}` (ArrayCreationExpr) is a distinct AST node from the bare `{cmd, tainted}`
+        // (ArrayInitializerExpr) fixed earlier for the same exec(cmdarray, envp) shape -- missing
+        // this variant alone caused 4 false negatives, all in the same real OWASP template.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { "
+                        + "void run(@RequestParam String id) throws Exception { "
+                        + "  String[] cmd = new String[] {\"echo\", id}; "
+                        + "  Runtime.getRuntime().exec(cmd); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        assertEquals(VulnerabilityType.COMMAND_INJECTION, findings.get(0).sinkRule().vulnerabilityType());
+    }
 }
