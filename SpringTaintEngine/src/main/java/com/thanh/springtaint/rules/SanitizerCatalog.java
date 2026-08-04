@@ -55,6 +55,14 @@ public class SanitizerCatalog {
                 // Takes just the filename component, discarding any directory traversal
                 // segments ("../") -- the standard Apache Commons IO fix for Path Traversal.
                 new SanitizerRule("FilenameUtils", "getName", 0, "Strips directory components, defeating Path Traversal"),
+                // Same idea as getName, minus the extension -- equally discards every directory
+                // component, so equally neutralizes traversal segments.
+                new SanitizerRule("FilenameUtils", "getBaseName", 0, "Strips directory components, defeating Path Traversal"),
+                // JDK-native equivalent of FilenameUtils.getName: File.getName() returns only the
+                // last path segment, discarding any "../" that came before it. Taint here is
+                // carried by the *receiver* (e.g. new File(path).getName()), not an argument --
+                // RECEIVER_INDEX mirrors how SinkCatalog models new URL(url).openStream().
+                new SanitizerRule("File", "getName", SanitizerRule.RECEIVER_INDEX, "Strips directory components, defeating Path Traversal"),
 
                 // UUID coercion: same "structurally can't carry a payload after this" effect as
                 // the numeric coercions above, for the common case of an id that should have
@@ -68,9 +76,22 @@ public class SanitizerCatalog {
                 //   javadoc), so there is no reliable way to say "only the validated branch is
                 //   safe" yet. Modeling them as sanitizers here would create false negatives
                 //   (silently trusting a value whose validation branch was never actually taken).
+                //   Same reasoning rules out whitelist-membership checks (e.g.
+                //   ALLOWED_FILES.contains(param)) for Path Traversal specifically.
                 // - Paths.get(...): parses a string into a Path object but does NOT strip "..";
                 //   traversal segments survive unchanged. Adding it would be a dangerous FALSE
                 //   sanitizer that actively defeats Path Traversal detection instead of fixing it.
+                // - File.getCanonicalPath()/getCanonicalFile() and Path.normalize(): both resolve
+                //   "." / ".." segments syntactically, but neither one *by itself* proves the
+                //   result stays inside an intended base directory -- normalize("base/../../etc/
+                //   passwd") still walks out of "base", it just does so without a literal ".."
+                //   left in the string. The real fix is normalize-then-check-containment (e.g.
+                //   result.startsWith(baseDir)), which is exactly the validator-style, branch-
+                //   dependent pattern excluded above: this engine cannot see that the containment
+                //   check actually guards the sink. Modeling normalize()/getCanonicalPath() alone
+                //   as sanitizers would be unsound -- it would silently clear taint on the most
+                //   common *unsafe* real-world Path Traversal pattern (normalize without a
+                //   follow-up containment check), trading a false positive for a false negative.
         ));
     }
 

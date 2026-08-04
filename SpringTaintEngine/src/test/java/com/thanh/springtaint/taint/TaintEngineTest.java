@@ -314,6 +314,41 @@ class TaintEngineTest {
     }
 
     @Test
+    void analyze_pathThroughFileGetNameOnTheReceiver_isSanitizedAndProducesNoFinding() {
+        // JDK-native equivalent of the FilenameUtils.getName test above, exercising the
+        // RECEIVER_INDEX sanitizer path: new File(path).getName() strips any "../" before the
+        // result reaches the FileInputStream sink.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { "
+                        + "java.io.InputStream open(@RequestParam String path) throws Exception { "
+                        + "  String safeName = new java.io.File(path).getName(); "
+                        + "  return new java.io.FileInputStream(safeName); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertTrue(findings.isEmpty());
+    }
+
+    @Test
+    void analyze_pathThroughFileGetCanonicalPath_isStillFlaggedNotSilentlySanitized() {
+        // getCanonicalPath() resolves "." / ".." syntactically but does NOT confirm the result
+        // stays inside any intended base directory -- deliberately NOT modeled as a sanitizer
+        // (see SanitizerCatalog). A tainted path must still reach the sink here.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { "
+                        + "java.io.InputStream open(@RequestParam String path) throws Exception { "
+                        + "  String resolved = new java.io.File(path).getCanonicalPath(); "
+                        + "  return new java.io.FileInputStream(resolved); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        assertEquals(VulnerabilityType.PATH_TRAVERSAL, findings.get(0).sinkRule().vulnerabilityType());
+    }
+
+    @Test
     void analyze_taintFlowsIntoJdbcTemplateQueryForMap_isFlaggedAsSqlInjection() {
         // Found missing by validating this engine against a real deliberately-vulnerable
         // Spring Boot project (malikashish8/vuln-spring): its SQL Injection used Spring's own

@@ -51,7 +51,11 @@ import java.util.Set;
  * Sanitizer-aware: when every callee a call site resolves to is a registered
  * {@link com.thanh.springtaint.rules.SanitizerRule} for the tainted argument position (M-B1),
  * taint stops there instead of continuing into the call's result -- e.g. an SQL string built
- * from {@code Integer.parseInt(id)} isn't reported as reaching a sink further down.
+ * from {@code Integer.parseInt(id)} isn't reported as reaching a sink further down. This also
+ * applies to {@link SinkRule#RECEIVER_INDEX}-shaped calls (taint carried by the receiver, not
+ * an argument), e.g. {@code new File(path).getName()} discards any directory/traversal
+ * component of a tainted {@code path}, so taint stops at {@code .getName()} instead of
+ * continuing into whatever consumes its return value.
  *
  * Bounded call-site sensitive: a {@link NodeRef} carries the chain of call sites it was
  * entered through (see its javadoc), up to {@link NodeRef#MAX_CONTEXT_DEPTH} frames deep, so
@@ -190,7 +194,7 @@ public class TaintEngine {
                 Set<MethodKey> callees = calleeBySite.getOrDefault(current.method(), Map.of())
                         .getOrDefault(to.label(), Set.of());
 
-                boolean sanitizedByEveryCallee = !callees.isEmpty() && argumentIndex != SinkRule.RECEIVER_INDEX
+                boolean sanitizedByEveryCallee = !callees.isEmpty()
                         && callees.stream().allMatch(callee -> rules.sanitizers().sanitizes(callee, argumentIndex));
                 if (sanitizedByEveryCallee) {
                     continue; // neutralized here: don't mark the call node (or its downstream) tainted

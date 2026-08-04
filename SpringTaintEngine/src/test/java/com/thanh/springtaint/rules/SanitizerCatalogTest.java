@@ -63,4 +63,32 @@ class SanitizerCatalogTest {
 
         assertFalse(catalog.sanitizes(new MethodKey("Paths", "get", 1), 0));
     }
+
+    @Test
+    void sanitizes_matchesFilenameUtilsGetBaseName() {
+        SanitizerCatalog catalog = SanitizerCatalog.defaults();
+
+        assertTrue(catalog.sanitizes(new MethodKey("FilenameUtils", "getBaseName", 1), 0));
+    }
+
+    @Test
+    void sanitizes_matchesFileGetNameOnTheReceiverNotAnArgument() {
+        // new File(path).getName() takes no arguments -- the taint being neutralized is
+        // carried by the call's receiver, so this must match at RECEIVER_INDEX only.
+        SanitizerCatalog catalog = SanitizerCatalog.defaults();
+
+        assertTrue(catalog.sanitizes(new MethodKey("File", "getName", 0), SanitizerRule.RECEIVER_INDEX));
+        assertFalse(catalog.sanitizes(new MethodKey("File", "getName", 0), 0));
+    }
+
+    @Test
+    void sanitizes_doesNotTreatCanonicalPathOrNormalizeAsASanitizer() {
+        // Neither resolves relative to a base directory by itself -- without a follow-up
+        // containment check (which this engine cannot correlate across branches), treating
+        // them as sanitizers would silently clear taint on real, unsafe traversal payloads.
+        SanitizerCatalog catalog = SanitizerCatalog.defaults();
+
+        assertFalse(catalog.sanitizes(new MethodKey("File", "getCanonicalPath", 0), SanitizerRule.RECEIVER_INDEX));
+        assertFalse(catalog.sanitizes(new MethodKey("Path", "normalize", 0), SanitizerRule.RECEIVER_INDEX));
+    }
 }
