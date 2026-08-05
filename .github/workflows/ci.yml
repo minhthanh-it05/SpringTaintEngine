@@ -13,13 +13,6 @@ permissions:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        # The Maven project lives in a subdirectory, not the repo root (repo root only has
-        # LICENSE + this SpringTaintEngine/ folder) -- every `run:` step below operates here.
-        # Action `with:` inputs (e.g. upload-sarif's sarif_file) are NOT affected by this and
-        # need the SpringTaintEngine/ prefix spelled out explicitly.
-        working-directory: SpringTaintEngine
     steps:
       - uses: actions/checkout@v4
 
@@ -31,17 +24,29 @@ jobs:
           cache: maven
           cache-dependency-path: SpringTaintEngine/pom.xml
 
+      # The Maven project lives in a subdirectory, not the repo root (repo root only has
+      # LICENSE + this SpringTaintEngine/ folder) -- this one step needs to run there.
       - name: Build, test, and package
+        working-directory: SpringTaintEngine
         run: mvn -B package
 
       - name: Self-scan the sample project (SARIF)
+        # Deliberately NOT working-directory: SpringTaintEngine, unlike the step above: SARIF
+        # artifactLocation.uri values are recorded exactly as the scanned-directory argument is
+        # spelled here, and GitHub Code Scanning resolves them relative to the repo root -- if
+        # this ran from SpringTaintEngine/ with a bare `src/...` argument, every finding would
+        # link to a nonexistent repo-root-relative path (confirmed: GitHub still *lists* such
+        # findings, it just can't resolve them into a real file). Every path below is spelled
+        # out with the SpringTaintEngine/ prefix instead, so the recorded paths match the real
+        # checked-out layout.
         run: |
           # shade-plugin replaces the main artifact in place, so the runnable jar is
           # SpringTaintEngine-<version>.jar -- NOT original-SpringTaintEngine-<version>.jar
           # (pre-shade, no bundled deps/Main-Class) which a bare `*.jar` glob could also match
           # depending on filesystem directory-entry order.
-          JAR=$(find target -maxdepth 1 -name 'SpringTaintEngine-*.jar' ! -name '*-sources.jar' | head -n 1)
-          java -jar "$JAR" src/main/resources/samples --format=console,sarif --out=target/taint-report
+          JAR=$(find SpringTaintEngine/target -maxdepth 1 -name 'SpringTaintEngine-*.jar' ! -name '*-sources.jar' | head -n 1)
+          java -jar "$JAR" SpringTaintEngine/src/main/resources/samples \
+            --format=console,sarif --out=SpringTaintEngine/target/taint-report
 
       - name: Upload SARIF to GitHub Code Scanning
         if: always()
