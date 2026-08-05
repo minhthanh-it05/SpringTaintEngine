@@ -2,6 +2,7 @@ package com.thanh.springtaint;
 
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.thanh.springtaint.baseline.Baseline;
 import com.thanh.springtaint.callgraph.CallGraph;
 import com.thanh.springtaint.callgraph.CallGraphBuilder;
 import com.thanh.springtaint.callgraph.CallGraphEdge;
@@ -44,7 +45,14 @@ import java.util.Set;
  *   --out=&lt;path-prefix&gt;           output file prefix for json/sarif (default: taint-report)
  *   --fail-on-findings             exit with a non-zero status if any HIGH/CRITICAL finding
  *                                   is reported -- for CI gating; off by default so a bare
- *                                   report-and-inspect run never breaks a script
+ *                                   report-and-inspect run never breaks a script. Findings
+ *                                   present in the baseline never count toward this.
+ *   --baseline=&lt;path&gt;              mark findings already present in this baseline file as
+ *                                   suppressed (see {@link Baseline}) -- still shown in every
+ *                                   report, just excluded from --fail-on-findings
+ *   --write-baseline=&lt;path&gt;        write every finding from this run to the baseline file,
+ *                                   overwriting it -- the "accept everything currently found"
+ *                                   action, typically run once and the result committed
  *   --debug                        also dump structure/CFG/DFG/call graph internals for
  *                                   every parsed method (the M1-M6 milestone-inspection view)
  *   --help
@@ -63,6 +71,8 @@ Main {
         String outPrefix = "taint-report";
         boolean failOnFindings = false;
         boolean debug = false;
+        Path baselinePath = null;
+        Path writeBaselinePath = null;
 
         for (String arg : args) {
             if (arg.startsWith("--format=")) {
@@ -71,6 +81,10 @@ Main {
                 outPrefix = arg.substring("--out=".length());
             } else if (arg.equals("--fail-on-findings")) {
                 failOnFindings = true;
+            } else if (arg.startsWith("--baseline=")) {
+                baselinePath = Path.of(arg.substring("--baseline=".length()));
+            } else if (arg.startsWith("--write-baseline=")) {
+                writeBaselinePath = Path.of(arg.substring("--write-baseline=".length()));
             } else if (arg.equals("--debug")) {
                 debug = true;
             } else if (arg.startsWith("--")) {
@@ -94,6 +108,21 @@ Main {
         TaintRules taintRules = TaintRules.defaults();
         List<Vulnerability> vulnerabilities = new Detector(taintRules).scanProject(projectFiles);
 
+        if (writeBaselinePath != null) {
+            Baseline.write(writeBaselinePath, vulnerabilities);
+            System.out.println("Baseline written to: " + writeBaselinePath.toAbsolutePath()
+                    + " (" + vulnerabilities.size() + " finding(s))");
+        }
+
+        if (baselinePath != null) {
+            Baseline baseline = Baseline.load(baselinePath);
+            vulnerabilities = vulnerabilities.stream()
+                    .map(v -> baseline.contains(v) ? v.asSuppressed() : v)
+                    .toList();
+            System.out.println("Loaded baseline from: " + baselinePath.toAbsolutePath()
+                    + " (" + baseline.size() + " known finding(s))");
+        }
+
         for (String format : formats) {
             switch (format) {
                 case "console" -> System.out.print(new ConsoleReporter().render(vulnerabilities));
@@ -104,6 +133,7 @@ Main {
         }
 
         boolean hasSeriousFinding = vulnerabilities.stream()
+                .filter(v -> !v.suppressed())
                 .anyMatch(v -> v.severity() == Severity.HIGH || v.severity() == Severity.CRITICAL);
         if (failOnFindings && hasSeriousFinding) {
             System.exit(1);
@@ -183,6 +213,9 @@ Main {
                   --format=<f1,f2,...>    Output formats: console, json, sarif (default: console)
                   --out=<prefix>          Output file prefix for json/sarif (default: taint-report)
                   --fail-on-findings      Exit with status 1 if any HIGH/CRITICAL finding is reported
+                                          (findings in the baseline never count toward this)
+                  --baseline=<path>       Mark findings already in this file as suppressed
+                  --write-baseline=<path> Write every finding from this run to the baseline file
                   --debug                 Also dump structure/CFG/DFG/call graph internals
                   --help, -h              Show this message
                 """);

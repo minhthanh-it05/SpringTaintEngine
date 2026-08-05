@@ -78,7 +78,7 @@ public class Detector {
                     type.displayName(), buildMessage(finding), finding.sourceMethod(), finding.source(),
                     sourceLocation.file(), sourceLocation.line(),
                     finding.sinkMethod(), finding.sinkCallSite(), sinkLocation.file(), sinkLocation.line(),
-                    finding.path()));
+                    finding.path(), false));
         }
 
         return vulnerabilities;

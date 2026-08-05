@@ -43,4 +43,16 @@ class ConsoleReporterTest {
         assertTrue(output.contains("sink:   Statement.executeQuery/1"));
         assertTrue(output.contains("-> SampleController.getUser/1 #0 PARAM"));
     }
+
+    @Test
+    void render_suppressedFinding_isMarkedAndCountedInTheHeader() {
+        List<Vulnerability> vulnerabilities = new Detector().scan(List.of(sampleControllerUnit())).stream()
+                .map(Vulnerability::asSuppressed)
+                .toList();
+
+        String output = new ConsoleReporter().render(vulnerabilities);
+
+        assertTrue(output.contains("(1 already in baseline)"));
+        assertTrue(output.contains("[SUPPRESSED - in baseline]"));
+    }
 }

@@ -76,6 +76,7 @@ public class SarifReporter implements Reporter {
             json.append("        {\n");
             json.append("          \"ruleId\": ").append(quote(v.type().name())).append(",\n");
             json.append("          \"level\": ").append(quote(sarifLevel(v.severity()))).append(",\n");
+            json.append("          \"partialFingerprints\": { \"springTaintEngine/v1\": ").append(quote(v.fingerprint())).append(" },\n");
             json.append("          \"message\": { \"text\": ").append(quote(v.message())).append(" }");
 
             // Prefer the sink location (where the dangerous call actually happens); fall back
@@ -92,10 +93,23 @@ public class SarifReporter implements Reporter {
                 json.append("                \"region\": { \"startLine\": ").append(Math.max(line, 1)).append(" }\n");
                 json.append("              }\n");
                 json.append("            }\n");
-                json.append("          ]\n");
-            } else {
-                json.append('\n');
+                json.append("          ]");
             }
+
+            // SARIF 2.1.0's own suppression mechanism (S3.11) -- GitHub Code Scanning and other
+            // SARIF-native consumers use this to keep a suppressed result out of the default
+            // alerts view without deleting it from the log, exactly the "still reported,
+            // excluded from gating" contract Vulnerability#suppressed documents. "external"
+            // means the suppression came from outside the tool run itself (our --baseline file),
+            // as opposed to "inSource" (e.g. a `// nosemgrep`-style code comment, which this
+            // engine doesn't support).
+            if (v.suppressed()) {
+                json.append(",\n");
+                json.append("          \"suppressions\": [\n");
+                json.append("            { \"kind\": \"external\", \"justification\": \"Present in the SpringTaintEngine baseline file\" }\n");
+                json.append("          ]");
+            }
+            json.append('\n');
 
             json.append("        }");
             json.append(i < vulnerabilities.size() - 1 ? ",\n" : "\n");

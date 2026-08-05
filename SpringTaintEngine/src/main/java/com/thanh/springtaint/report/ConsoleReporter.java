@@ -11,7 +11,12 @@ public class ConsoleReporter implements Reporter {
     @Override
     public String render(List<Vulnerability> vulnerabilities) {
         StringBuilder out = new StringBuilder();
-        out.append("Taint analysis report - ").append(vulnerabilities.size()).append(" finding(s)\n");
+        long suppressedCount = vulnerabilities.stream().filter(Vulnerability::suppressed).count();
+        out.append("Taint analysis report - ").append(vulnerabilities.size()).append(" finding(s)");
+        if (suppressedCount > 0) {
+            out.append(" (").append(suppressedCount).append(" already in baseline)");
+        }
+        out.append('\n');
         out.append("=".repeat(60)).append('\n');
 
         if (vulnerabilities.isEmpty()) {
@@ -21,7 +26,11 @@ public class ConsoleReporter implements Reporter {
 
         for (Vulnerability v : vulnerabilities) {
             out.append('[').append(v.id()).append("] ").append(v.severity())
-                    .append(" - ").append(v.title()).append(" (").append(v.cweId()).append(")\n");
+                    .append(" - ").append(v.title()).append(" (").append(v.cweId()).append(")");
+            if (v.suppressed()) {
+                out.append(" [SUPPRESSED - in baseline]");
+            }
+            out.append('\n');
             out.append("  ").append(v.message()).append('\n');
 
             out.append("  source: ").append(v.sourceMethod());

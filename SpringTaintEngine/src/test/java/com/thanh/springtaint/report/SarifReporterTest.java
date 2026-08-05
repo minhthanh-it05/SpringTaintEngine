@@ -79,6 +79,29 @@ class SarifReporterTest {
         assertFalse(sarif.contains("samples\\\\SampleController.java"));
     }
 
+    @Test
+    void render_suppressedFinding_emitsSarifNativeSuppressions() {
+        List<Vulnerability> vulnerabilities = new Detector().scan(List.of(sampleControllerUnit()));
+        Vulnerability suppressed = vulnerabilities.get(0).asSuppressed();
+
+        String sarif = new SarifReporter().render(List.of(suppressed));
+
+        assertTrue(sarif.contains("\"suppressions\""));
+        assertTrue(sarif.contains("\"kind\": \"external\""));
+        assertTrue(sarif.contains("\"partialFingerprints\""));
+        assertEquals(count(sarif, '{'), count(sarif, '}'));
+        assertEquals(count(sarif, '['), count(sarif, ']'));
+    }
+
+    @Test
+    void render_nonSuppressedFinding_omitsSuppressionsBlock() {
+        List<Vulnerability> vulnerabilities = new Detector().scan(List.of(sampleControllerUnit()));
+
+        String sarif = new SarifReporter().render(vulnerabilities);
+
+        assertFalse(sarif.contains("\"suppressions\""));
+    }
+
     private static long count(String text, char c) {
         return text.chars().filter(ch -> ch == c).count();
     }

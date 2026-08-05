@@ -64,6 +64,19 @@ class JsonReporterTest {
         assertEquals(count(json, '{'), count(json, '}'));
     }
 
+    @Test
+    void render_includesFingerprintAndSuppressedFlag() {
+        List<Vulnerability> vulnerabilities = new Detector().scan(List.of(sampleControllerUnit()));
+        Vulnerability suppressed = vulnerabilities.get(0).asSuppressed();
+
+        String json = new JsonReporter().render(List.of(suppressed));
+
+        assertTrue(json.contains("\"fingerprint\": \"" + suppressed.fingerprint() + "\""));
+        assertTrue(json.contains("\"suppressed\": true"));
+        assertEquals(count(json, '{'), count(json, '}'));
+        assertEquals(count(json, '['), count(json, ']'));
+    }
+
     private static long count(String text, char c) {
         return text.chars().filter(ch -> ch == c).count();
     }

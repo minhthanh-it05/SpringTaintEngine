@@ -40,6 +40,8 @@ public class JsonReporter implements Reporter {
         field(json, inner, "cweId", v.cweId());
         field(json, inner, "title", v.title());
         field(json, inner, "message", v.message());
+        field(json, inner, "fingerprint", v.fingerprint());
+        rawField(json, inner, "suppressed", String.valueOf(v.suppressed()));
 
         json.append(inner).append("\"source\": {\n");
         String sourceIndent = inner + "  ";
@@ -82,6 +84,10 @@ public class JsonReporter implements Reporter {
     private void field(StringBuilder json, String indent, String name, String value) {
         json.append(indent).append('"').append(name).append("\": ")
                 .append(value == null ? "null" : quote(value)).append(",\n");
+    }
+
+    private void rawField(StringBuilder json, String indent, String name, String rawValue) {
+        json.append(indent).append('"').append(name).append("\": ").append(rawValue).append(",\n");
     }
 
     private void rawFieldLast(StringBuilder json, String indent, String name, String rawValue) {
