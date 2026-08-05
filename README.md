@@ -1,5 +1,9 @@
 # SpringTaintEngine
 
+[![CI](https://github.com/minhthanh-it05/SpringTaintEngine/actions/workflows/ci.yml/badge.svg)](https://github.com/minhthanh-it05/SpringTaintEngine/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Java 21](https://img.shields.io/badge/Java-21-orange.svg)](https://openjdk.org/projects/jdk/21/)
+
 A self-implemented static taint-analysis engine for **Java / Spring MVC** code. Given a
 project's source tree, it traces how untrusted HTTP input (`@RequestParam`, `@RequestBody`,
 `@PathVariable`, ...) flows through the code and reports every path that reaches a dangerous
@@ -11,6 +15,11 @@ narrowly to Spring MVC injection vulnerabilities and built **entirely from scrat
 no off-the-shelf SAST/dataflow library underneath. Every stage — control-flow graph, data-flow
 graph, call graph, interprocedural taint propagation — is implemented in this repository, on
 top of [JavaParser](https://github.com/javaparser/javaparser)'s AST.
+
+**Contents:** [Architecture](#architecture) · [Features](#features) ·
+[Detection coverage](#detection-coverage) · [Build & run](#build--run) ·
+[Benchmark](#benchmark) · [Trade-offs & limitations](#trade-offs--limitations) ·
+[Testing](#testing)
 
 ## Architecture
 
@@ -33,18 +42,18 @@ flowchart TD
     SARIF --> GHCS["GitHub Code Scanning"]
 ```
 
-| Stage | Package | What it does |
-|---|---|---|
-| Parse | `parser` | Loads source into JavaParser ASTs; resolves real library types via Maven's dependency classpath when available |
-| Structure | `structure` | Extracts classes/methods/parameters and their annotations |
-| CFG | `cfg` | Per-method control-flow graph (if/while/for/try-catch-finally) |
-| DFG | `dfg` | Per-method data-flow graph, including branch-scoped validator sanitization (guard clauses) |
-| Call Graph | `callgraph` | Whole-project call graph, with interface/abstract dispatch fan-out |
-| Rules | `rules` | Source / Sink / Sanitizer / Validator catalogs — plain data, easy to extend |
-| Taint | `taint` | Interprocedural analysis via memoized per-(method, parameter) summaries |
-| Detect | `detect` | Classifies raw findings into CWE/severity-tagged vulnerabilities, with a stable fingerprint per finding |
-| Baseline | `baseline` | Marks previously-accepted findings as suppressed, independent of line numbers |
-| Report | `report` | Console, JSON, and SARIF 2.1.0 output |
+| # | Stage | Package | What it does |
+|---|---|---|---|
+| 1 | Parse | `parser` | Load source into ASTs; resolve real types via Maven's classpath |
+| 2 | Structure | `structure` | Extract classes / methods / parameters / annotations |
+| 3 | CFG | `cfg` | Per-method control-flow graph |
+| 4 | DFG | `dfg` | Per-method data-flow graph + branch-scoped sanitization |
+| 5 | Call Graph | `callgraph` | Whole-project call graph, CHA-based dispatch fan-out |
+| 6 | Taint | `taint` | Memoized per-(method, parameter) summary propagation |
+| 7 | Detect | `detect` | Classify findings into CWE + severity, fingerprint each |
+| 8 | Report | `report` | Console / JSON / SARIF 2.1.0 output |
+| — | Rules | `rules` | Source / Sink / Sanitizer / Validator catalogs |
+| — | Baseline | `baseline` | Mark previously-accepted findings as suppressed |
 
 ## Features
 
@@ -72,34 +81,33 @@ flowchart TD
 
 ### Detection coverage
 
-| Vulnerability | CWE | Example sink |
-|---|---|---|
-| SQL Injection | CWE-89 | `Statement.executeQuery`, `Connection.prepareStatement`, `JdbcTemplate.query*` |
-| Command Injection | CWE-78 | `Runtime.exec` (any overload, any argument position) |
-| Server-Side Request Forgery | CWE-918 | `RestTemplate.getForObject/getForEntity/exchange`, `new URL(...).openStream()` |
-| Cross-Site Scripting | CWE-79 | `PrintWriter.print/println` |
-| Path Traversal | CWE-22 | `new FileInputStream/FileOutputStream/FileReader/FileWriter(...)`, `Files.newInputStream/readAllBytes` |
-| Insecure Deserialization | CWE-502 | `ObjectInputStream.readObject()` |
+| Vulnerability | CWE | Example sink | Sink signatures |
+|---|:---:|---|:---:|
+| SQL Injection | CWE-89 | `Statement.executeQuery` | 11 |
+| Command Injection | CWE-78 | `Runtime.exec` | 1 |
+| Server-Side Request Forgery | CWE-918 | `RestTemplate.getForObject` | 6 |
+| Cross-Site Scripting | CWE-79 | `PrintWriter.println` | 2 |
+| Path Traversal | CWE-22 | `new FileInputStream(path)` | 6 |
+| Insecure Deserialization | CWE-502 | `ObjectInputStream.readObject` | 1 |
 
-**Sources** (6): `@RequestParam`, `@PathVariable`, `@RequestBody`, `@RequestHeader`,
-`@CookieValue`, `@MatrixVariable`.
+*(27 sink signatures total across these 6 categories — full list in `rules.SinkCatalog`.)*
 
-**Sanitizers** (15, call-based): numeric coercion (`Integer.parseInt`, `Long.valueOf`, ...),
-`HtmlUtils.htmlEscape`, `URLEncoder.encode`, Apache Commons `StringEscapeUtils`
-(`escapeHtml4`/`escapeSql`/`escapeHtml`), `Jsoup.clean`, `FilenameUtils`
-(`getName`/`getBaseName`), `File.getName()`, `UUID.fromString`.
-
-**Validators** (2, branch-scoped): `StringUtils.isNumeric`, `Pattern.matches` — only these two
-are modeled, specifically because branch-scoped clearing (see Features above) is what makes
-them sound to include at all; see `ValidatorCatalog`'s Javadoc.
+| Catalog | Count | Examples |
+|---|:---:|---|
+| Sources | 6 | `@RequestParam`, `@PathVariable`, `@RequestBody`, `@RequestHeader` |
+| Sanitizers | 15 | `Integer.parseInt`, `HtmlUtils.htmlEscape`, `StringEscapeUtils.escapeHtml4` |
+| Validators | 2 | `StringUtils.isNumeric`, `Pattern.matches` (branch-scoped only — see Features) |
 
 All four catalogs (`rules.SourceCatalog`, `rules.SinkCatalog`, `rules.SanitizerCatalog`,
-`rules.ValidatorCatalog`) are plain data classes — extending detection coverage is adding a line,
-not touching the engine.
+`rules.ValidatorCatalog`) are plain data classes — extending detection coverage is adding a
+line, not touching the engine.
 
 ## Build & run
 
+The Maven project lives in the `SpringTaintEngine/` subdirectory of this repo:
+
 ```bash
+cd SpringTaintEngine
 mvn test     # run the test suite (127 tests)
 mvn package  # produces target/SpringTaintEngine-*.jar (runnable, dependencies bundled)
 
@@ -252,7 +260,7 @@ exhaustive coverage. Documented honestly, not hidden in the fine print:
 ## Testing
 
 ```bash
-mvn test
+cd SpringTaintEngine && mvn test
 ```
 
 127 tests exercise every stage of the pipeline independently (CFG/DFG/call graph builders, all
