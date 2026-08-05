@@ -7,12 +7,14 @@ import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.AssignExpr;
+import com.github.javaparser.ast.expr.BinaryExpr;
 import com.github.javaparser.ast.expr.ConditionalExpr;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.LambdaExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.expr.SwitchExpr;
+import com.github.javaparser.ast.expr.UnaryExpr;
 import com.github.javaparser.ast.stmt.BlockStmt;
 import com.github.javaparser.ast.stmt.CatchClause;
 import com.github.javaparser.ast.stmt.ForStmt;
@@ -24,11 +26,15 @@ import com.github.javaparser.ast.stmt.TryStmt;
 import com.github.javaparser.ast.stmt.WhileStmt;
 import com.github.javaparser.ast.stmt.YieldStmt;
 
+import com.thanh.springtaint.rules.ValidatorCatalog;
+import com.thanh.springtaint.rules.ValidatorRule;
+
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -69,10 +75,20 @@ import java.util.Set;
  */
 public class DfgBuilder {
 
+    private final ValidatorCatalog validators;
+
     private List<DfgNode> nodes;
     private List<DfgEdge> edges;
     private int nextId;
     private Map<String, DfgNode> currentDefs;
+
+    public DfgBuilder() {
+        this(ValidatorCatalog.defaults());
+    }
+
+    public DfgBuilder(ValidatorCatalog validators) {
+        this.validators = validators;
+    }
 
     public DataFlowGraph build(MethodDeclaration method) {
         return buildFrom(method.getParameters(), method.getBody().orElse(null));
@@ -171,11 +187,124 @@ public class DfgBuilder {
         tryStmt.getFinallyBlock().ifPresent(finallyBlock -> processStatements(finallyBlock.getStatements()));
     }
 
+    /**
+     * Branch-scoped validator sanitization: when the condition is (or {@code &&}-chains)
+     * one or more {@link ValidatorRule} calls, the variable each one validates is treated as
+     * sanitized -- but only inside the branch proven to run after the check passed, via
+     * {@link #applyValidatedSanitizers}. A guard-clause shape (
+     * {@code if (!StringUtils.isNumeric(x)) return;}, no {@code else}, then-branch always
+     * exits) is handled too: everything reachable *after* the whole if-statement only runs
+     * because the negated condition held, i.e. the validator call itself was true, so the same
+     * sanitization is applied directly to the surviving flow instead of a branch.
+     *
+     * See {@link ValidatorCatalog}'s javadoc for why this used to be unsound (and isn't
+     * anymore) and {@link #collectValidatedVariables} for exactly which condition shapes are
+     * recognized.
+     */
     private void processIf(IfStmt ifStmt) {
         evaluate(ifStmt.getCondition());
+        Set<String> validatedInThen = collectValidatedVariables(ifStmt.getCondition());
         branchAndMerge(List.of(
-                () -> processStatement(ifStmt.getThenStmt()),
+                () -> {
+                    applyValidatedSanitizers(validatedInThen);
+                    processStatement(ifStmt.getThenStmt());
+                },
                 () -> ifStmt.getElseStmt().ifPresent(this::processStatement)));
+
+        if (ifStmt.getElseStmt().isEmpty() && alwaysExits(ifStmt.getThenStmt())) {
+            singleNegatedValidatorVariable(ifStmt.getCondition())
+                    .ifPresent(variable -> applyValidatedSanitizers(Set.of(variable)));
+        }
+    }
+
+    /**
+     * Collects every variable a {@code &&}-chain of {@link ValidatorRule} calls validates,
+     * e.g. {@code x != null && StringUtils.isNumeric(x)} yields {@code {"x"}}. Deliberately
+     * does not descend into {@code ||} or comparison operators: with OR, only "at least one
+     * side is true" is known, not which -- treating either side's variable as validated there
+     * would be unsound. Only a simple variable read (not a field, method call, or expression)
+     * as the validated argument is recognized, since anything else can't be safely written
+     * back into {@link #currentDefs} by name.
+     */
+    private Set<String> collectValidatedVariables(Expression condition) {
+        Set<String> validated = new LinkedHashSet<>();
+        collectValidatedVariablesInto(condition, validated);
+        return validated;
+    }
+
+    private void collectValidatedVariablesInto(Expression expr, Set<String> validated) {
+        if (expr.isEnclosedExpr()) {
+            collectValidatedVariablesInto(expr.asEnclosedExpr().getInner(), validated);
+            return;
+        }
+        if (expr.isBinaryExpr() && expr.asBinaryExpr().getOperator() == BinaryExpr.Operator.AND) {
+            collectValidatedVariablesInto(expr.asBinaryExpr().getLeft(), validated);
+            collectValidatedVariablesInto(expr.asBinaryExpr().getRight(), validated);
+            return;
+        }
+        if (!expr.isMethodCallExpr()) {
+            return;
+        }
+        MethodCallExpr call = expr.asMethodCallExpr();
+        String scopeName = call.getScope().filter(Expression::isNameExpr)
+                .map(scope -> scope.asNameExpr().getNameAsString())
+                .orElse(null);
+        List<Expression> arguments = call.getArguments();
+        for (ValidatorRule rule : validators.matching(scopeName, call.getNameAsString())) {
+            if (rule.valueArgumentIndex() < arguments.size()) {
+                Expression valueArgument = arguments.get(rule.valueArgumentIndex());
+                if (valueArgument.isNameExpr()) {
+                    validated.add(valueArgument.asNameExpr().getNameAsString());
+                }
+            }
+        }
+    }
+
+    /** Overrides each already-tracked variable's reaching definition with a fresh, source-less {@link DfgNode.Kind#VALIDATED} node -- the same "nothing flows in, so taint search stops here" mechanism call-based {@link com.thanh.springtaint.rules.SanitizerRule}s use, just applied to a variable directly instead of a call's result. */
+    private void applyValidatedSanitizers(Set<String> validatedVariables) {
+        for (String variable : validatedVariables) {
+            if (currentDefs.containsKey(variable)) {
+                currentDefs.put(variable, newNode(DfgNode.Kind.VALIDATED, variable, variable + " (validated)"));
+            }
+        }
+    }
+
+    /**
+     * True when {@code statement} unconditionally leaves the enclosing method/loop (
+     * {@code return}/{@code throw}/{@code break}/{@code continue}), including when that's just
+     * the last statement of a block -- good enough for the guard-clause shape this exists for
+     * ({@code if (!valid(x)) { log(...); return; }}), not a full reachability analysis of
+     * every path through the block.
+     */
+    private boolean alwaysExits(Statement statement) {
+        if (statement.isReturnStmt() || statement.isThrowStmt()
+                || statement.isBreakStmt() || statement.isContinueStmt()) {
+            return true;
+        }
+        if (statement.isBlockStmt()) {
+            NodeList<Statement> statements = statement.asBlockStmt().getStatements();
+            return !statements.isEmpty() && alwaysExits(statements.get(statements.size() - 1));
+        }
+        return false;
+    }
+
+    /**
+     * Recognizes exactly {@code !<single validator call>} (e.g. {@code !StringUtils.isNumeric(x)}),
+     * returning the variable that call validates. Restricted to a single call, not a whole
+     * negated {@code &&}-chain: by De Morgan's, {@code !(a && b)} is {@code !a || !b} -- only
+     * "at least one failed" is known, which {@link #collectValidatedVariables}'s own OR
+     * restriction already rules out for the same soundness reason.
+     */
+    private Optional<String> singleNegatedValidatorVariable(Expression condition) {
+        if (!condition.isUnaryExpr()) {
+            return Optional.empty();
+        }
+        UnaryExpr unary = condition.asUnaryExpr();
+        if (unary.getOperator() != UnaryExpr.Operator.LOGICAL_COMPLEMENT) {
+            return Optional.empty();
+        }
+        Set<String> validated = collectValidatedVariables(unary.getExpression());
+        return validated.size() == 1 ? Optional.of(validated.iterator().next()) : Optional.empty();
     }
 
     private void processWhile(WhileStmt whileStmt) {

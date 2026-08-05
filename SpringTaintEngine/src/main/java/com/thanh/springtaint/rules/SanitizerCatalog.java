@@ -70,14 +70,16 @@ public class SanitizerCatalog {
                 new SanitizerRule("UUID", "fromString", 0, "UUID coercion neutralizes injection payloads")
 
                 // Deliberately NOT included:
-                // - StringUtils.isNumeric / Pattern.matches and other validator-style checks:
-                //   these return a boolean used in an `if`, they don't transform the value --
-                //   and this engine is flow-insensitive across branches (see DfgBuilder's
-                //   javadoc), so there is no reliable way to say "only the validated branch is
-                //   safe" yet. Modeling them as sanitizers here would create false negatives
-                //   (silently trusting a value whose validation branch was never actually taken).
-                //   Same reasoning rules out whitelist-membership checks (e.g.
-                //   ALLOWED_FILES.contains(param)) for Path Traversal specifically.
+                // - StringUtils.isNumeric / Pattern.matches: these return a boolean used in an
+                //   `if`, they don't transform a value the way every rule above does -- what
+                //   they actually neutralize is the *original variable*, and only on the branch
+                //   where the check passed. That needs branch-scoped handling, which now lives
+                //   in ValidatorCatalog + DfgBuilder#processIf instead of here (see
+                //   ValidatorCatalog's javadoc for why it used to be unsound and isn't anymore).
+                // - Whitelist-membership checks (e.g. ALLOWED_FILES.contains(param)) for Path
+                //   Traversal specifically: same branch-scoping need as above, but not yet added
+                //   to ValidatorCatalog -- `contains` is too generic a method name to register
+                //   as a validator without a real risk of matching unrelated collections.
                 // - Paths.get(...): parses a string into a Path object but does NOT strip "..";
                 //   traversal segments survive unchanged. Adding it would be a dangerous FALSE
                 //   sanitizer that actively defeats Path Traversal detection instead of fixing it.

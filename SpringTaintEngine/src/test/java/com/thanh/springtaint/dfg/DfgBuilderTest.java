@@ -396,6 +396,126 @@ class DfgBuilderTest {
                 .anyMatch(e -> e.from().equals(args) && e.to().equals(sinkCall) && "arg0".equals(e.label())));
     }
 
+    @Test
+    void build_validatorGuardedBranch_sinkInsideLinksFromValidatedNodeNotParam() {
+        // Root-cause fix: StringUtils.isNumeric(param) proves param is digits-only on the
+        // branch where it's true -- but only inside that branch. Before this fix, this shape
+        // was either a permanent false positive (the validator was explicitly excluded from
+        // SanitizerCatalog -- see its javadoc) or, if added there naively, an unsound false
+        // negative on code paths that never actually ran the check.
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run(String param) { if (StringUtils.isNumeric(param)) { sink(param); } }");
+
+        DataFlowGraph dfg = new DfgBuilder().build(method);
+
+        DfgNode param = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.PARAM && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+        DfgNode sinkCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("sink"))
+                .findFirst().orElseThrow();
+        DfgNode validated = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.VALIDATED && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(validated) && e.to().equals(sinkCall) && "arg0".equals(e.label())));
+        assertTrue(dfg.edges().stream().noneMatch(e -> e.from().equals(param) && e.to().equals(sinkCall)));
+    }
+
+    @Test
+    void build_negatedValidatorGuardClause_sinkAfterEarlyReturnLinksFromValidatedNode() {
+        // The other common real-world shape: "if (!valid(x)) return;" instead of wrapping the
+        // safe usage in an if-body. Everything after the whole if-statement only runs because
+        // the negated condition held, i.e. isNumeric(param) was true.
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run(String param) { if (!StringUtils.isNumeric(param)) { return; } sink(param); }");
+
+        DataFlowGraph dfg = new DfgBuilder().build(method);
+
+        DfgNode param = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.PARAM && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+        DfgNode sinkCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("sink"))
+                .findFirst().orElseThrow();
+        DfgNode validated = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.VALIDATED && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(validated) && e.to().equals(sinkCall) && "arg0".equals(e.label())));
+        assertTrue(dfg.edges().stream().noneMatch(e -> e.from().equals(param) && e.to().equals(sinkCall)));
+    }
+
+    @Test
+    void build_validatorInAndChain_stillSanitizesTheCheckedVariable() {
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run(String param) { "
+                        + "if (param != null && StringUtils.isNumeric(param)) { sink(param); } }");
+
+        DataFlowGraph dfg = new DfgBuilder().build(method);
+
+        DfgNode param = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.PARAM && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+        DfgNode sinkCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("sink"))
+                .findFirst().orElseThrow();
+
+        assertTrue(dfg.nodes().stream().anyMatch(n -> n.kind() == DfgNode.Kind.VALIDATED));
+        assertTrue(dfg.edges().stream().noneMatch(e -> e.from().equals(param) && e.to().equals(sinkCall)));
+    }
+
+    @Test
+    void build_validatorInOrChain_doesNotSanitize() {
+        // Soundness boundary: with ||, only "at least one side is true" is known -- the
+        // isNumeric side could be the false one. Must NOT clear taint here.
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run(String param, boolean flag) { "
+                        + "if (flag || StringUtils.isNumeric(param)) { sink(param); } }");
+
+        DataFlowGraph dfg = new DfgBuilder().build(method);
+
+        DfgNode param = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.PARAM && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+        DfgNode sinkCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("sink"))
+                .findFirst().orElseThrow();
+
+        assertTrue(dfg.nodes().stream().noneMatch(n -> n.kind() == DfgNode.Kind.VALIDATED));
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(param) && e.to().equals(sinkCall) && "arg0".equals(e.label())));
+    }
+
+    @Test
+    void build_validatedBranchDoesNotAlwaysExit_sinkAfterIfStillSeesOriginalTaint() {
+        // The guard-clause narrowing only fires when the then-branch is a guaranteed exit
+        // (return/throw/break/continue). Here it merely does nothing special and falls through,
+        // so a sink AFTER the if must still be reachable from the original tainted param --
+        // branchAndMerge's own join (not the guard-clause path) is what's exercised here, and it
+        // must conservatively keep both possibilities (validated-in-branch, untouched-if-not).
+        MethodDeclaration method = StaticJavaParser.parseMethodDeclaration(
+                "void run(String param) { if (StringUtils.isNumeric(param)) { } sink(param); }");
+
+        DataFlowGraph dfg = new DfgBuilder().build(method);
+
+        DfgNode param = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.PARAM && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+        DfgNode sinkCall = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.CALL && n.label().startsWith("sink"))
+                .findFirst().orElseThrow();
+        DfgNode merge = dfg.nodes().stream()
+                .filter(n -> n.kind() == DfgNode.Kind.MERGE && "param".equals(n.variableName()))
+                .findFirst().orElseThrow();
+
+        assertTrue(dfg.edges().stream().anyMatch(e -> e.from().equals(param) && e.to().equals(merge)));
+        assertTrue(dfg.edges().stream()
+                .anyMatch(e -> e.from().equals(merge) && e.to().equals(sinkCall) && "arg0".equals(e.label())));
+    }
+
     private static DfgNode nodeFor(DataFlowGraph dfg, String variableName) {
         return dfg.nodes().stream()
                 .filter(n -> n.kind() == DfgNode.Kind.ASSIGN && variableName.equals(n.variableName()))

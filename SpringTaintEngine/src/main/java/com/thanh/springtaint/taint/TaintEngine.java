@@ -20,61 +20,66 @@ import com.thanh.springtaint.rules.TaintedParameter;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 /**
- * Whole-project, interprocedural taint propagation.
+ * Whole-project, interprocedural taint propagation, computed via memoized per-method
+ * {@link MethodSummary}s rather than walking into every callee's DFG at every call site.
  *
- * Runs a worklist reachability analysis over a graph stitched together from every parsed
- * method/constructor's DFG (M5) via the Call Graph (M6): a tainted value that flows into an
- * argument of a call to an internally-declared method/constructor jumps into that callee's
- * matching PARAM node, and a tainted RETURN jumps back into the CALL node it was entered from
- * (see "bounded call-site sensitivity" below). Whenever taint reaches an argument position of
- * a call that matches a registered {@link SinkRule} (M7), a {@link TaintFinding} is recorded
- * with the full source-to-sink path.
+ * For each internally-declared method and each of its parameter positions, a summary answers
+ * one context-independent question once: "if this parameter is tainted, which sinks does that
+ * reach (transitively, through whatever this method itself calls), and does the method's own
+ * return value become tainted as a result?" ({@link #computeSummary}). A caller whose own
+ * argument is tainted just looks the callee's summary up ({@link #walkMethod}) -- splicing the
+ * summary's own witness path onto its own for any sink reported, and continuing to propagate
+ * past the call site only when the summary says the return is actually tainted -- instead of
+ * re-deriving any of that by walking the callee's DFG itself. A summary is computed at most
+ * once per (method, parameter index) pair no matter how many call sites reach it, so the whole
+ * analysis is roughly linear in program size rather than exponential in call-chain depth.
  *
- * The correlation between a DFG {@code CALL} node and the {@link MethodKey}(s) it
- * resolves to is done by matching call-site text ({@code MethodCallExpr.toString()} or
- * {@code ObjectCreationExpr.toString()}) against the Call Graph's edges for that caller,
- * rather than re-implementing scope/type resolution here -- reuses CallGraphBuilder's
- * resolution as the single source of truth instead of risking the two builders disagreeing.
- * A call site can resolve to more than one callee (CallGraphBuilder fans an interface/abstract
- * call out to every concrete override it can find), in which case taint is propagated into
- * -- and sinks are checked against -- every one of them.
+ * This replaced an earlier design where a taint value carried a bounded call-site stack (a
+ * "NodeRef" identifying a DFG node together with up to 4 call frames of context) so a tainted
+ * RETURN could jump back to the exact call site it came from; beyond that fixed depth,
+ * propagation degraded to broadcasting a method's RETURN to every one of its call sites,
+ * regardless of which one actually supplied the tainted argument -- imprecise (not unsound: the
+ * old worklist never removed reachable nodes, so nothing was ever missed by hitting the cap,
+ * only over-reported past it) for any call chain deeper than 4 hops, and an arbitrary number to
+ * begin with. Summaries have no depth limit at all: {@code aTainted -> b -> c -> d -> e -> f}
+ * resolves exactly regardless of chain length, and a summary's own recursion naturally answers
+ * "which call site does this taint belong to" by construction -- a caller only ever consults the
+ * summary for the argument position *it itself* proved tainted, so an unrelated sibling caller
+ * passing an untainted argument into the same shared method never triggers it (see
+ * {@code TaintEngineTest#analyze_contextSensitivity_doesNotLeakTaintIntoAnUnrelatedCallersSink}
+ * and {@code #analyze_boundedContextSensitivity_avoidsFalsePositiveTwoHopsDeep}, both still
+ * passing under this design with no depth-dependent caveat left to document).
  *
- * Sanitizer-aware: when every callee a call site resolves to is a registered
- * {@link com.thanh.springtaint.rules.SanitizerRule} for the tainted argument position (M-B1),
- * taint stops there instead of continuing into the call's result -- e.g. an SQL string built
- * from {@code Integer.parseInt(id)} isn't reported as reaching a sink further down. This also
- * applies to {@link SinkRule#RECEIVER_INDEX}-shaped calls (taint carried by the receiver, not
- * an argument), e.g. {@code new File(path).getName()} discards any directory/traversal
- * component of a tainted {@code path}, so taint stops at {@code .getName()} instead of
- * continuing into whatever consumes its return value.
+ * One behavior change from the old design, worth calling out explicitly: the old worklist added
+ * *every* call node reached by a tainted argument to the propagation frontier unconditionally,
+ * even when the callee's own body provably never lets that argument influence its return (e.g.
+ * {@code void log(String msg) { }}) -- a blunt "assume opaque calls might return tainted data"
+ * default that was really only meaningful for genuinely external/unresolvable calls. Now that a
+ * summary can answer this precisely for every internally-declared callee, propagation past an
+ * internal call site is gated on {@link MethodSummary#returnTainted()} instead -- strictly more
+ * precise, not less recall (see each catalog/DfgBuilder javadoc for the analogous "don't
+ * silently trust a validation that was never proven" reasoning applied here to call returns).
+ * External/unresolved calls keep the old conservative default (always assume possibly tainted),
+ * since there's no body to summarize at all.
  *
- * Bounded call-site sensitive: a {@link NodeRef} carries the chain of call sites it was
- * entered through (see its javadoc), up to {@link NodeRef#MAX_CONTEXT_DEPTH} frames deep, so
- * when taint returns from a callee it jumps back into that *specific* caller -- and that
- * caller's caller, and so on up to the depth cap -- rather than broadcasting to every caller
- * of a method. Beyond the cap (or once a context is fully consumed by returning through it),
- * propagation degrades to broadcasting from there on, same as a fully context-insensitive
- * analysis would. The cap exists because an unbounded call-stack-sensitive (k=∞) analysis has
- * a potentially unbounded state space under recursion; a small fixed depth is the standard
- * k-CFA compromise.
+ * Recursion (a method whose own call graph eventually calls back into a summary already being
+ * computed) is broken with an optimistic, empty placeholder rather than a full fixed-point
+ * iteration -- see {@link #computeSummary}'s javadoc for exactly what that does and doesn't
+ * cover.
  *
- * Known trade-offs (same "get it running end-to-end first" spirit as the
- * simplifications already documented on CfgBuilder/DfgBuilder/CallGraphBuilder):
- * - One parent pointer per node: when two different sources both flow into the same
- *   downstream node (e.g. two tainted parameters concatenated together), only the
- *   first-discovered path is kept for reporting, even though both origins do reach the
- *   sink. A full multi-source tabulation (IFDS-style) would remove this.
- * - Only call sites that {@link DfgBuilder} actually models (see its javadoc on
- *   unhandled expression forms) can be jumped through or matched as a sink.
+ * Everything downstream of "which node reached which node" -- CHA-based interface/abstract
+ * dispatch fan-out, sanitizer-aware call-argument neutralization, {@link SinkRule#RECEIVER_INDEX}
+ * handling -- carries over unchanged from the DFG/CallGraph layers this builds on.
  */
 public class TaintEngine {
 
@@ -83,7 +88,9 @@ public class TaintEngine {
     private final Map<MethodKey, CallableDeclaration<?>> callablesByKey = new HashMap<>();
     private final Map<MethodKey, DataFlowGraph> dfgByKey = new HashMap<>();
     private final Map<MethodKey, Map<String, Set<MethodKey>>> calleeBySite = new HashMap<>();
-    private final Map<MethodKey, List<NodeRef>> callSitesByCallee = new HashMap<>();
+
+    private final Map<ParamKey, MethodSummary> summaryCache = new HashMap<>();
+    private final Set<ParamKey> summariesInProgress = new HashSet<>();
 
     public TaintEngine(List<CompilationUnit> units, TaintRules rules) {
         this.rules = rules;
@@ -116,20 +123,6 @@ public class TaintEngine {
                     .computeIfAbsent(edge.callSite(), k -> new LinkedHashSet<>())
                     .add(edge.callee());
         }
-
-        for (Map.Entry<MethodKey, DataFlowGraph> entry : dfgByKey.entrySet()) {
-            MethodKey caller = entry.getKey();
-            Map<String, Set<MethodKey>> sites = calleeBySite.getOrDefault(caller, Map.of());
-            for (DfgNode node : entry.getValue().nodes()) {
-                if (node.kind() != DfgNode.Kind.CALL) {
-                    continue;
-                }
-                for (MethodKey callee : sites.getOrDefault(node.label(), Set.of())) {
-                    callSitesByCallee.computeIfAbsent(callee, k -> new ArrayList<>())
-                            .add(new NodeRef(caller, node.id()));
-                }
-            }
-        }
     }
 
     /** The declaration backing {@code key} (method or constructor), or null when {@code key} isn't one of the parsed callables (e.g. an external sink). */
@@ -138,158 +131,181 @@ public class TaintEngine {
     }
 
     public List<TaintFinding> analyze() {
-        Set<NodeRef> visited = new LinkedHashSet<>();
-        Map<NodeRef, NodeRef> cameFrom = new HashMap<>();
-        Map<NodeRef, TaintedParameter> rootSource = new HashMap<>();
-        Deque<NodeRef> worklist = new ArrayDeque<>();
         List<TaintFinding> findings = new ArrayList<>();
-
         for (Map.Entry<MethodKey, CallableDeclaration<?>> entry : callablesByKey.entrySet()) {
             MethodKey method = entry.getKey();
             for (TaintedParameter source : rules.sources().findSources(entry.getValue())) {
-                DfgNode paramNode = dfgByKey.get(method).paramNode(source.index());
-                NodeRef ref = new NodeRef(method, paramNode.id());
-                if (visited.add(ref)) {
-                    cameFrom.put(ref, null);
-                    rootSource.put(ref, source);
-                    worklist.add(ref);
+                MethodSummary summary = computeSummary(method, source.index());
+                for (SinkWitness witness : summary.sinkWitnesses()) {
+                    findings.add(new TaintFinding(method, source, witness.sinkCalleeMethod(),
+                            witness.sinkRule(), witness.sinkCallSite(), witness.path()));
                 }
             }
         }
-
-        while (!worklist.isEmpty()) {
-            NodeRef current = worklist.poll();
-            DataFlowGraph dfg = dfgByKey.get(current.method());
-            DfgNode currentNode = dfg.node(current.nodeId());
-
-            if (currentNode.kind() == DfgNode.Kind.RETURN) {
-                List<NodeRef> returnTargets = returnTargets(current);
-                for (NodeRef callSite : returnTargets) {
-                    if (visited.add(callSite)) {
-                        cameFrom.put(callSite, current);
-                        worklist.add(callSite);
-                    }
-                }
-            }
-
-            for (DfgEdge edge : dfg.edges()) {
-                if (edge.from().id() != currentNode.id()) {
-                    continue;
-                }
-                DfgNode to = edge.to();
-                // Still inside the same call frame -- carries the same context as current.
-                NodeRef toRef = new NodeRef(current.method(), to.id(), current.context());
-
-                boolean isArgEdge = to.kind() == DfgNode.Kind.CALL && edge.label() != null && edge.label().startsWith("arg");
-                boolean isReceiverEdge = to.kind() == DfgNode.Kind.CALL && "receiver".equals(edge.label());
-                if (!isArgEdge && !isReceiverEdge) {
-                    if (visited.add(toRef)) {
-                        cameFrom.put(toRef, current);
-                        worklist.add(toRef);
-                    }
-                    continue;
-                }
-
-                int argumentIndex = isReceiverEdge ? SinkRule.RECEIVER_INDEX : Integer.parseInt(edge.label().substring(3));
-                Set<MethodKey> callees = calleeBySite.getOrDefault(current.method(), Map.of())
-                        .getOrDefault(to.label(), Set.of());
-
-                boolean sanitizedByEveryCallee = !callees.isEmpty()
-                        && callees.stream().allMatch(callee -> rules.sanitizers().sanitizes(callee, argumentIndex));
-                if (sanitizedByEveryCallee) {
-                    continue; // neutralized here: don't mark the call node (or its downstream) tainted
-                }
-
-                if (visited.add(toRef)) {
-                    cameFrom.put(toRef, current);
-                    worklist.add(toRef);
-                }
-
-                for (MethodKey callee : callees) {
-                    recordSinkHits(current, to, argumentIndex, callee, cameFrom, rootSource, findings);
-                    if (argumentIndex != SinkRule.RECEIVER_INDEX) {
-                        jumpIntoCallee(callee, argumentIndex, current, to, visited, cameFrom, worklist);
-                    }
-                }
-            }
-        }
-
         return findings;
     }
 
     /**
-     * With a non-empty context, pops the innermost frame and returns there -- and only there
-     * -- carrying whatever frames remain as the returned-to node's own context, so a further
-     * return (if this whole chain is itself nested inside more callers) keeps unwinding
-     * precisely up to the depth cap. An empty context (source-originating return, or context
-     * already fully consumed) falls back to broadcasting to every known call site of this
-     * method, same as a fully context-insensitive analysis.
+     * Returns the memoized summary for "parameter {@code paramIndex} of {@code method} is
+     * tainted", computing it via {@link #walkMethod} on first request and caching the result --
+     * every later caller (a real annotated source landing here as {@code (method, paramIndex)}
+     * too, since a source and a summary consumer ask the exact same question) reuses it without
+     * re-walking {@code method}'s DFG.
+     *
+     * Recursion guard: if this exact {@code (method, paramIndex)} is already being computed
+     * higher up the current call stack (direct or mutual recursion), returns
+     * {@link MethodSummary#EMPTY} instead of recursing forever. This is a narrow, deliberate
+     * under-approximation -- not a full fixed-point iteration over the recursive cycle -- so a
+     * sink reachable only by unwinding the recursion itself (vanishingly rare in the Spring MVC
+     * request-handling code this engine targets) can be missed. A sink reachable directly within
+     * the method, or via any non-recursive call it makes, is unaffected: that's found by the
+     * very walk this guard is protecting, which keeps running to completion regardless of the
+     * placeholder returned for the cyclic edge.
      */
-    private List<NodeRef> returnTargets(NodeRef current) {
-        if (current.context().isEmpty()) {
-            return callSitesByCallee.getOrDefault(current.method(), List.of());
+    private MethodSummary computeSummary(MethodKey method, int paramIndex) {
+        ParamKey key = new ParamKey(method, paramIndex);
+        MethodSummary cached = summaryCache.get(key);
+        if (cached != null) {
+            return cached;
         }
-        NodeRef.CallSite innermost = current.context().get(0);
-        List<NodeRef.CallSite> remaining = current.context().subList(1, current.context().size());
-        return List.of(new NodeRef(innermost.callerMethod(), innermost.callerCallNodeId(), List.copyOf(remaining)));
+        if (!summariesInProgress.add(key)) {
+            return MethodSummary.EMPTY;
+        }
+        MethodSummary summary = walkMethod(method, paramIndex);
+        summariesInProgress.remove(key);
+        summaryCache.put(key, summary);
+        return summary;
     }
 
-    private void recordSinkHits(NodeRef argSource, DfgNode callNode, int argumentIndex, MethodKey callee,
-                                 Map<NodeRef, NodeRef> cameFrom, Map<NodeRef, TaintedParameter> rootSource,
-                                 List<TaintFinding> findings) {
-        for (SinkRule sinkRule : rules.sinks().match(callee)) {
-            if (!sinkRule.isArgumentTainted(argumentIndex)) {
-                continue;
-            }
-            List<NodeRef> refs = reconstructPath(argSource, cameFrom);
-            NodeRef rootRef = refs.get(0);
+    /**
+     * The shared worklist: starting from {@code method}'s own {@code paramIndex}-th PARAM node,
+     * walks {@code method}'s DFG (edges only, no cross-method jumping) to answer exactly what
+     * {@link MethodSummary} promises. Used identically whether the caller is {@link #analyze()}
+     * asking about a real annotated source or {@link #computeSummary} asking on some other
+     * caller's behalf -- there is nothing source-specific about the walk itself, only about
+     * what {@link #analyze()} does with the resulting witnesses afterward.
+     */
+    private MethodSummary walkMethod(MethodKey method, int paramIndex) {
+        DataFlowGraph dfg = dfgByKey.get(method);
+        DfgNode paramNode = dfg.paramNode(paramIndex);
 
-            List<PathStep> path = new ArrayList<>();
-            for (NodeRef ref : refs) {
-                path.add(new PathStep(ref.method(), dfgByKey.get(ref.method()).node(ref.nodeId())));
-            }
-            path.add(new PathStep(argSource.method(), callNode));
+        Set<Integer> visited = new LinkedHashSet<>();
+        Map<Integer, Integer> cameFrom = new HashMap<>();
+        Deque<Integer> worklist = new ArrayDeque<>();
+        List<SinkWitness> sinkWitnesses = new ArrayList<>();
+        boolean[] returnTainted = {false};
 
-            findings.add(new TaintFinding(rootRef.method(), rootSource.get(rootRef), callee, sinkRule,
-                    callNode.label(), path));
+        visited.add(paramNode.id());
+        worklist.add(paramNode.id());
+
+        while (!worklist.isEmpty()) {
+            int currentId = worklist.poll();
+            DfgNode currentNode = dfg.node(currentId);
+
+            if (currentNode.kind() == DfgNode.Kind.RETURN) {
+                returnTainted[0] = true;
+                // RETURN nodes have no outgoing DFG edges in this model -- nothing further to walk.
+            }
+
+            for (DfgEdge edge : dfg.edges()) {
+                if (edge.from().id() != currentId) {
+                    continue;
+                }
+                walkEdge(method, dfg, edge, paramNode, cameFrom, visited, worklist, sinkWitnesses);
+            }
         }
+
+        return new MethodSummary(returnTainted[0], List.copyOf(sinkWitnesses));
     }
 
-    private void jumpIntoCallee(MethodKey callee, int argumentIndex, NodeRef current, DfgNode callNode,
-                                 Set<NodeRef> visited, Map<NodeRef, NodeRef> cameFrom, Deque<NodeRef> worklist) {
-        if (callGraph.isExternal(callee)) {
+    private void walkEdge(MethodKey method, DataFlowGraph dfg, DfgEdge edge, DfgNode paramNode,
+                           Map<Integer, Integer> cameFrom, Set<Integer> visited, Deque<Integer> worklist,
+                           List<SinkWitness> sinkWitnesses) {
+        DfgNode to = edge.to();
+        boolean isArgEdge = to.kind() == DfgNode.Kind.CALL && edge.label() != null && edge.label().startsWith("arg");
+        boolean isReceiverEdge = to.kind() == DfgNode.Kind.CALL && "receiver".equals(edge.label());
+
+        if (!isArgEdge && !isReceiverEdge) {
+            if (visited.add(to.id())) {
+                cameFrom.put(to.id(), edge.from().id());
+                worklist.add(to.id());
+            }
             return;
         }
-        DataFlowGraph calleeDfg = dfgByKey.get(callee);
-        long paramCount = calleeDfg.nodes().stream().filter(n -> n.kind() == DfgNode.Kind.PARAM).count();
-        if (argumentIndex >= paramCount) {
-            return;
+
+        int argumentIndex = isReceiverEdge ? SinkRule.RECEIVER_INDEX : Integer.parseInt(edge.label().substring(3));
+        Set<MethodKey> callees = calleeBySite.getOrDefault(method, Map.of()).getOrDefault(to.label(), Set.of());
+
+        boolean sanitizedByEveryCallee = !callees.isEmpty()
+                && callees.stream().allMatch(callee -> rules.sanitizers().sanitizes(callee, argumentIndex));
+        if (sanitizedByEveryCallee) {
+            return; // neutralized here: don't mark the call node (or its downstream) tainted
         }
-        DfgNode calleeParamNode = calleeDfg.paramNode(argumentIndex);
-        List<NodeRef.CallSite> newContext = pushContext(current.context(), current.method(), callNode.id());
-        NodeRef calleeRef = new NodeRef(callee, calleeParamNode.id(), newContext);
-        if (visited.add(calleeRef)) {
-            cameFrom.put(calleeRef, current);
-            worklist.add(calleeRef);
+
+        for (MethodKey callee : callees) {
+            for (SinkRule sinkRule : rules.sinks().match(callee)) {
+                if (sinkRule.isArgumentTainted(argumentIndex)) {
+                    List<PathStep> path = reconstructPath(method, dfg, edge.from().id(), cameFrom, paramNode);
+                    path.add(new PathStep(method, to));
+                    sinkWitnesses.add(new SinkWitness(sinkRule, callee, to.label(), path));
+                }
+            }
+        }
+
+        boolean propagateOnward = isReceiverEdge || callees.isEmpty();
+        if (!propagateOnward) {
+            for (MethodKey callee : callees) {
+                if (callGraph.isExternal(callee)) {
+                    propagateOnward = true;
+                    continue;
+                }
+                DataFlowGraph calleeDfg = dfgByKey.get(callee);
+                if (calleeDfg == null) {
+                    continue;
+                }
+                long calleeParamCount = calleeDfg.nodes().stream().filter(n -> n.kind() == DfgNode.Kind.PARAM).count();
+                if (argumentIndex < 0 || argumentIndex >= calleeParamCount) {
+                    continue;
+                }
+                MethodSummary calleeSummary = computeSummary(callee, argumentIndex);
+                if (calleeSummary.returnTainted()) {
+                    propagateOnward = true;
+                }
+                for (SinkWitness inner : calleeSummary.sinkWitnesses()) {
+                    List<PathStep> stitched = reconstructPath(method, dfg, edge.from().id(), cameFrom, paramNode);
+                    stitched.add(new PathStep(method, to));
+                    stitched.addAll(inner.path());
+                    sinkWitnesses.add(new SinkWitness(inner.sinkRule(), inner.sinkCalleeMethod(),
+                            inner.sinkCallSite(), stitched));
+                }
+            }
+        }
+
+        if (propagateOnward && visited.add(to.id())) {
+            cameFrom.put(to.id(), edge.from().id());
+            worklist.add(to.id());
         }
     }
 
-    /** Prepends the new frame and keeps only the {@link NodeRef#MAX_CONTEXT_DEPTH} most recent ones. */
-    private List<NodeRef.CallSite> pushContext(List<NodeRef.CallSite> currentContext, MethodKey callerMethod, int callNodeId) {
-        List<NodeRef.CallSite> newContext = new ArrayList<>();
-        newContext.add(new NodeRef.CallSite(callerMethod, callNodeId));
-        for (int i = 0; i < currentContext.size() && newContext.size() < NodeRef.MAX_CONTEXT_DEPTH; i++) {
-            newContext.add(currentContext.get(i));
+    private List<PathStep> reconstructPath(MethodKey method, DataFlowGraph dfg, int endNodeId,
+                                            Map<Integer, Integer> cameFrom, DfgNode paramNode) {
+        List<Integer> nodeIds = new ArrayList<>();
+        Integer cursor = endNodeId;
+        while (cursor != null) {
+            nodeIds.add(cursor);
+            cursor = cameFrom.get(cursor);
         }
-        return List.copyOf(newContext);
+        List<PathStep> path = new ArrayList<>();
+        for (int i = nodeIds.size() - 1; i >= 0; i--) {
+            path.add(new PathStep(method, dfg.node(nodeIds.get(i))));
+        }
+        if (path.isEmpty()) {
+            path.add(new PathStep(method, paramNode));
+        }
+        return path;
     }
 
-    private List<NodeRef> reconstructPath(NodeRef end, Map<NodeRef, NodeRef> cameFrom) {
-        List<NodeRef> refs = new ArrayList<>();
-        for (NodeRef cur = end; cur != null; cur = cameFrom.get(cur)) {
-            refs.add(cur);
-        }
-        Collections.reverse(refs);
-        return refs;
+    /** One (method, parameter index) pair -- the unit a {@link MethodSummary} is memoized by. */
+    private record ParamKey(MethodKey method, int paramIndex) {
     }
 }

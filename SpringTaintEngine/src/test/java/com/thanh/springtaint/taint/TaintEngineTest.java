@@ -277,14 +277,13 @@ class TaintEngineTest {
     }
 
     @Test
-    void analyze_boundedContextSensitivity_avoidsFalsePositiveTwoHopsDeep() {
+    void analyze_contextSensitivity_avoidsFalsePositiveTwoHopsDeep() {
         // Two-hop version of the context-sensitivity regression test above: aTainted -> b -> c,
-        // with an unrelated caller dClean also calling b directly into a sink. Under a
-        // depth-1-only context (reset on every call crossing instead of accumulated), b's
-        // RETURN loses track of "this call chain started at aTainted" the moment it crosses the
-        // SECOND method boundary (into c and back), degrading to a broadcast that would
-        // incorrectly flag dClean too even though `safe` is never tainted. Accumulating context
-        // up to NodeRef.MAX_CONTEXT_DEPTH (4) fixes this for chains up to that depth.
+        // with an unrelated caller dClean also calling b directly into a sink. Each method's
+        // summary is keyed by (method, parameter index), independent of any caller's identity --
+        // dClean's own call `b(safe)` only ever consults b's summary for the argument dClean
+        // itself supplied (`safe`, never tainted, since dClean's parameter carries no source
+        // annotation), so it can never observe a fact that only holds for aTainted's argument.
         CompilationUnit unit = StaticJavaParser.parse(
                 "class Handler { private java.sql.Statement statement; "
                         + "String c(String x) { return x; } "
@@ -297,6 +296,62 @@ class TaintEngineTest {
 
         assertTrue(findings.stream().noneMatch(f -> f.path().stream()
                 .anyMatch(s -> s.method().methodName().equals("dClean"))));
+    }
+
+    @Test
+    void analyze_contextSensitivity_holdsPastTheOldFixedContextDepth() {
+        // Same property as the two-hop test above, but through a 5-hop identity chain
+        // (b -> c -> d -> e -> f) before the tainted value's RETURN ever unwinds back out to
+        // dClean's call site. The previous design (a NodeRef carrying up to
+        // MAX_CONTEXT_DEPTH = 4 call frames) would have exhausted its context exactly here and
+        // degraded to broadcasting b's RETURN to every one of its call sites, incorrectly
+        // flagging dClean's genuinely-untainted `safe` too -- this is the scenario the whole
+        // summary-based rewrite exists to fix, not just a raised cap: a method's summary is
+        // computed once per (method, parameter index) with no depth bookkeeping at all, so this
+        // holds for a chain of any length, not just up to some fixed number of hops.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class Handler { private java.sql.Statement statement; "
+                        + "String f(String x) { return x; } "
+                        + "String e(String x) { return f(x); } "
+                        + "String d(String x) { return e(x); } "
+                        + "String c(String x) { return d(x); } "
+                        + "String b(String x) { return c(x); } "
+                        + "void aTainted(@RequestParam String x) { b(x); } "
+                        + "String dClean(String safe) throws Exception { "
+                        + "  return statement.executeQuery(b(safe)).toString(); } }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertTrue(findings.stream().noneMatch(f -> f.path().stream()
+                .anyMatch(s -> s.method().methodName().equals("dClean"))));
+    }
+
+    @Test
+    void analyze_deepCallChain_stillReachesASinkBeyondTheOldFixedContextDepth() {
+        // Recall counterpart to the test above: the sink now sits at the BOTTOM of a 5-hop
+        // relay chain (aTainted -> b -> c -> d -> e -> f, sink inside f) instead of consuming a
+        // passthrough return value -- this exercises MethodSummary#sinkWitnesses splicing at
+        // every one of the 5 levels, not just #returnTainted, and the reported path must show
+        // every hop: a witness inside a deeply memoized summary is reused verbatim, but each
+        // caller still splices its own local prefix onto it on the way back up.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class Handler { private java.sql.Statement statement; "
+                        + "void f(String x) throws Exception { statement.executeQuery(x); } "
+                        + "void e(String x) throws Exception { f(x); } "
+                        + "void d(String x) throws Exception { e(x); } "
+                        + "void c(String x) throws Exception { d(x); } "
+                        + "void b(String x) throws Exception { c(x); } "
+                        + "void aTainted(@RequestParam String x) throws Exception { b(x); } }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        TaintFinding finding = findings.get(0);
+        assertEquals(VulnerabilityType.SQL_INJECTION, finding.sinkRule().vulnerabilityType());
+        for (String methodName : List.of("aTainted", "b", "c", "d", "e", "f")) {
+            assertTrue(finding.path().stream().anyMatch(s -> s.method().methodName().equals(methodName)),
+                    "expected path to include a step in " + methodName);
+        }
     }
 
     @Test
@@ -328,6 +383,63 @@ class TaintEngineTest {
         List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
 
         assertTrue(findings.isEmpty());
+    }
+
+    @Test
+    void analyze_sqlInjectionGuardedByNumericValidator_isSanitizedAndProducesNoFinding() {
+        // End-to-end proof of the branch-scoped validator fix (DfgBuilder#processIf): id is
+        // proven digits-only before it ever reaches the query, on the only branch that runs the
+        // query at all. Before this fix, this exact shape was excluded from SanitizerCatalog as
+        // unsound to model (see its javadoc) and would have been a permanent false positive.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { "
+                        + "String getUser(@RequestParam String id, java.sql.Statement statement) throws Exception { "
+                        + "  if (StringUtils.isNumeric(id)) { "
+                        + "    String query = \"SELECT * FROM users WHERE id = \" + id; "
+                        + "    return statement.executeQuery(query).toString(); "
+                        + "  } "
+                        + "  return null; "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertTrue(findings.isEmpty());
+    }
+
+    @Test
+    void analyze_sqlInjectionGuardedByNegatedValidatorEarlyReturn_isSanitizedAndProducesNoFinding() {
+        // Same fix, exercising the guard-clause shape instead: "if (!valid(id)) return;".
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { "
+                        + "String getUser(@RequestParam String id, java.sql.Statement statement) throws Exception { "
+                        + "  if (!StringUtils.isNumeric(id)) { return null; } "
+                        + "  String query = \"SELECT * FROM users WHERE id = \" + id; "
+                        + "  return statement.executeQuery(query).toString(); "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertTrue(findings.isEmpty());
+    }
+
+    @Test
+    void analyze_sqlInjectionGuardedByValidatorInOrChain_isStillFlagged() {
+        // Soundness boundary, end-to-end: with ||, isNumeric(id) need not be the side that was
+        // true, so id must still be treated as tainted.
+        CompilationUnit unit = StaticJavaParser.parse(
+                "class SampleController { "
+                        + "String getUser(@RequestParam String id, boolean flag, java.sql.Statement statement) throws Exception { "
+                        + "  if (flag || StringUtils.isNumeric(id)) { "
+                        + "    String query = \"SELECT * FROM users WHERE id = \" + id; "
+                        + "    return statement.executeQuery(query).toString(); "
+                        + "  } "
+                        + "  return null; "
+                        + "} }");
+
+        List<TaintFinding> findings = new TaintEngine(List.of(unit), TaintRules.defaults()).analyze();
+
+        assertEquals(1, findings.size());
+        assertEquals(VulnerabilityType.SQL_INJECTION, findings.get(0).sinkRule().vulnerabilityType());
     }
 
     @Test
