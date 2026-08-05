@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # The Maven project lives in a subdirectory, not the repo root (repo root only has
+        # LICENSE + this SpringTaintEngine/ folder) -- every `run:` step below operates here.
+        # Action `with:` inputs (e.g. upload-sarif's sarif_file) are NOT affected by this and
+        # need the SpringTaintEngine/ prefix spelled out explicitly.
+        working-directory: SpringTaintEngine
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: SpringTaintEngine/pom.xml
+
+      - name: Build, test, and package
+        run: mvn -B package
+
+      - name: Self-scan the sample project (SARIF)
+        run: |
+          # shade-plugin replaces the main artifact in place, so the runnable jar is
+          # SpringTaintEngine-<version>.jar -- NOT original-SpringTaintEngine-<version>.jar
+          # (pre-shade, no bundled deps/Main-Class) which a bare `*.jar` glob could also match
+          # depending on filesystem directory-entry order.
+          JAR=$(find target -maxdepth 1 -name 'SpringTaintEngine-*.jar' ! -name '*-sources.jar' | head -n 1)
+          java -jar "$JAR" src/main/resources/samples --format=console,sarif --out=target/taint-report
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: SpringTaintEngine/target/taint-report.sarif
